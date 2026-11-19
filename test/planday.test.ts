@@ -7,7 +7,7 @@ import { createPlandayGateway, plandayToolCatalog, resolvePlandayChange, type Ga
 import { REDACTION_MARKER } from '../src/errors.js';
 import { fixedOutputs, RESULT_WITHHELD } from '../src/fallbacks.js';
 import { FIXED_CORPUS } from '../src/fixed-corpus.generated.js';
-import { CLIENT_ID, SHIFT_CREATED, withToken } from './helpers.js';
+import { CLIENT_ID, SHIFT_CREATED, TOKEN_URL, withToken } from './helpers.js';
 
 const TOKEN = 'tttt-gggg-wwww-vvvv-1';
 // Pseudonym keys: 32 or more random printable characters that share no piece with any text of ours.
@@ -403,5 +403,78 @@ describe('the pseudonym key anywhere', () => {
     results.push(await gw.callTool('list_employees', { search: key.replace(/\d/g, '') }));
     expect(results[0]?.isError).toBeUndefined();
     expect(leaked([key], [results, records])).toEqual([]);
+  });
+});
+
+describe('after review 1', () => {
+  it('takes 62 days with both dates included, and refuses 63', async () => {
+    const { gw, calls } = planday({
+      'GET /scheduling/v1.0/shifts': { data: [], paging: PAGING },
+      'GET /punchclock/v1.0/punchclockshifts': { data: [], paging: PAGING },
+    });
+    // 2026-11-01 to 2027-01-01 is 62 days; to 2027-01-02 is 63.
+    for (const tool of ['list_shifts', 'list_punch_clock_records']) {
+      expect((await call(gw, tool, { from: '2026-11-01', to: '2027-01-01' })).isError, tool).toBeUndefined();
+      expect((await call(gw, tool, { from: '2026-11-01', to: '2027-01-02' })).isError, tool).toBe(true);
+      expect((await call(gw, tool, { from: '2026-11-01', to: '2026-11-01' })).isError, tool).toBeUndefined();
+    }
+    expect(calls).toHaveLength(4);
+  });
+
+  it('catches a rejected promise from an asynchronous onRefreshToken, and keeps using the new token', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => void unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const ROTATED = 'refresh-token-rotated-4242'; // gitleaks:allow (a test value, not a token)
+      let tokenCalls = 0;
+      const bodies: string[] = [];
+      const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input) === TOKEN_URL) {
+          tokenCalls += 1;
+          bodies.push(String(init?.body));
+          return Response.json({ access_token: `access-token-${tokenCalls}-0000000000`, expires_in: 3600, refresh_token: ROTATED });
+        }
+        return Response.json({ data: [], paging: PAGING });
+      }) as typeof fetch;
+      let now = 1_000_000;
+      const gw = createPlandayGateway({
+        clientId: CLIENT_ID,
+        refreshToken: TOKEN,
+        fetchImpl,
+        now: () => now,
+        onRefreshToken: async () => {
+          throw new Error('host store down');
+        },
+      });
+      expect((await call(gw, 'list_departments', {})).isError).toBeUndefined();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      now += 3_600_000;
+      expect((await call(gw, 'list_departments', {})).isError).toBeUndefined();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(unhandled).toEqual([]);
+      expect(new URLSearchParams(bodies[1]).get('refresh_token')).toBe(ROTATED);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('refuses a pseudonym key that is not valid UTF-16, with the sealed refusal and no piece of it', () => {
+    const pieces = (key: string) => Array.from({ length: key.length - 5 }, (_, i) => key.slice(i, i + 6));
+    for (const key of [`Qh7Vz2Lr9Xw4Nc8T\uD800p3Yk6Bm1Fs5Jd0Ga`, `\uDC00Wy3Rk8Pq1Zt6Hv9Lc2Xn5Bg7Md4Js0Fe`, `Zr8qLw2Xv7NcT4pK9mYb3HsD6fJgQ1aE\uDBFF`]) {
+      for (const broken of [{}, { baseUrl: 'not a url' }, { refreshToken: 'short' }]) {
+        let caught: Error | undefined;
+        try {
+          createPlandayGateway({ clientId: CLIENT_ID, refreshToken: TOKEN, ...broken, policy: { pseudonymKey: key } } as never);
+        } catch (error) {
+          caught = error as Error;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect(caught!.name).toBe('ConfigError');
+        expect(String(caught!.stack)).toBe(`${caught!.name}: ${caught!.message}`);
+        const text = [caught!.message, caught!.stack, JSON.stringify(caught)].join(' ');
+        for (const piece of pieces(key)) expect(text, piece).not.toContain(piece);
+      }
+    }
   });
 });

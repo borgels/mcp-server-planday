@@ -163,7 +163,7 @@ const pageShape = (max: number) => ({
   offset: z.number().int().min(0).max(1_000_000).optional().describe('Skip this many records (default 0).'),
   limit: z.number().int().min(1).max(max).optional().describe(`Records per page (default 50, at most ${max}).`),
 });
-/** At most this many days per shift or punch clock query. */
+/** At most this many days per shift or punch clock query, both dates included. */
 const MAX_PERIOD_DAYS = 62;
 
 function period(input: Record<string, unknown>): string | undefined {
@@ -171,7 +171,8 @@ function period(input: Record<string, unknown>): string | undefined {
   const to = String(input.to);
   const days = daysBetween(from, to);
   if (days < 0) return 'to is before from.';
-  return days > MAX_PERIOD_DAYS ? `Ask for at most ${MAX_PERIOD_DAYS} days at a time.` : undefined;
+  // Both dates count: 2026-11-01 to 2026-11-01 is one day.
+  return days + 1 > MAX_PERIOD_DAYS ? `Ask for at most ${MAX_PERIOD_DAYS} days at a time.` : undefined;
 }
 
 const WRITE_NOTE = 'Off unless writes are enabled (PLANDAY_ENABLE_WRITES, or the gateway host policy enableWrites).';
@@ -214,7 +215,7 @@ export const PLANDAY_TOOLS: ToolDefinition[] = [
     name: 'planday_list_employees',
     title: 'List employees (Planday)',
     description:
-      'Active employees, a page at a time: name, job title, work e-mail and mobile, departments, employee groups, skills and hire date. CPR number, bank account, birth date, salary identifier, home address and wages are never read.',
+      'Active employees, a page at a time: name, job title, work e-mail and mobile, departments, employee groups, skills and hire date. CPR number, bank account, birth date, salary identifier, home address and wages are never passed on.',
     inputShape: {
       search: z
         .string()
@@ -236,7 +237,7 @@ export const PLANDAY_TOOLS: ToolDefinition[] = [
     name: 'planday_get_employee',
     title: 'Get employee (Planday)',
     description:
-      'One employee: name, job title, work e-mail and mobile, departments, groups, skills, supervisor, hire and end date. CPR number, bank account, birth date, salary identifier, home address, gender and wages are never read.',
+      'One employee: name, job title, work e-mail and mobile, departments, groups, skills, supervisor, hire and end date. CPR number, bank account, birth date, salary identifier, home address, gender and wages are never passed on.',
     inputShape: { employeeId: recordId('The employee id.') },
     annotations: READ_TOOL_ANNOTATIONS,
     returnsUpstreamContent: true,

@@ -20,7 +20,7 @@ export interface PlandayClientOptions {
    * and does not document rotation; if it rotates one, the client uses the
    * new one from then on, and a host that stores tokens can save it here.
    */
-  onRefreshToken?: (refreshToken: string) => void;
+  onRefreshToken?: (refreshToken: string) => void | Promise<void>;
   /** API base URL (default https://openapi.planday.com; env PLANDAY_BASE_URL). */
   baseUrl?: string;
   /** Token endpoint (default https://id.planday.com/connect/token; env PLANDAY_TOKEN_URL). */
@@ -197,7 +197,7 @@ export class PlandayClient implements UpstreamClient {
   readonly redactor: SecretRedactor;
   readonly clientId?: string;
   private refreshToken?: string;
-  private readonly onRefreshToken?: (refreshToken: string) => void;
+  private readonly onRefreshToken?: (refreshToken: string) => void | Promise<void>;
   readonly baseUrl: string;
   private readonly tokenUrl: string;
   private access?: { token: string; expiresAt: number };
@@ -341,7 +341,12 @@ export class PlandayClient implements UpstreamClient {
       this.redactor.addSecret(rotated);
       this.refreshToken = rotated;
       try {
-        this.onRefreshToken?.(rotated);
+        const stored: unknown = this.onRefreshToken?.(rotated);
+        // A host that stores the token asynchronously: a rejected promise must not become an unhandled
+        // rejection (which ends a Node process). The token is in use in memory either way.
+        if (stored && typeof (stored as Promise<void>).then === 'function') {
+          (stored as Promise<void>).then(undefined, () => undefined);
+        }
       } catch {
         // A host's callback failing does not fail the call; the token is in use in memory.
       }

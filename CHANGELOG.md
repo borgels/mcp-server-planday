@@ -19,9 +19,9 @@ the lessons of the reviews of the Billy and WooCommerce servers.
   pay fields), positions (no revenue fields), shift requests and punch clock
   records.
 - Personal data: the `special` parameter is never sent, so CPR number, bank
-  account, birth date and salary identifier are not asked for; answers are
-  parsed with a schema per resource that drops them (and address and gender)
-  if they come anyway. The employee search refuses digits, since Planday also
+  account and birth date are not asked for; answers are parsed with a schema
+  per resource that drops them, and the ordinary fields salary identifier,
+  address and gender, whenever they come. The employee search refuses digits, since Planday also
   matches it against the CPR number and the salary identifier.
 - Write tools, off by default: create a draft shift (`isDraft` true,
   `allowConflicts` false, break rules on, no wage), assign a shift or make it
@@ -34,6 +34,8 @@ the lessons of the reviews of the Billy and WooCommerce servers.
   keeps ids, dates and times, never a name, a search or a comment; the
   caller and the request id only as pseudonyms (`policy.pseudonymKey`, at
   least 32 characters or bytes, admitted like the refresh token and known to
-  the error guard before anything is validated).
+  the error guard before anything is validated; registering it cannot
+  throw). Periods are at most 62 days, both dates included. A host's
+  `onRefreshToken` may return a promise; a rejection is caught.
 - Not yet run against a live Planday portal: the tests use answers shaped as
   the published OpenAPI documents show them.

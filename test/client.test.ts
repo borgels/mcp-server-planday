@@ -619,7 +619,7 @@ describe('OAuth with the refresh token', () => {
       () => tokenAnswer('access-token-first-000000', { refresh_token: ROTATED }),
       () => tokenAnswer('access-token-second-00000'),
     ]);
-    const c = client(fetchImpl, { now: () => now, onRefreshToken: token => seen.push(token) });
+    const c = client(fetchImpl, { now: () => now, onRefreshToken: token => void seen.push(token) });
     await c.get('/x');
     now += 3_600_000;
     await c.get('/y');

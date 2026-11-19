@@ -33,7 +33,7 @@ No tool deletes, publishes a schedule, approves punch clock records for payroll,
 
 ### Personal data
 
-Planday holds an employee's CPR number (`ssn`), bank account, birth date and salary identifier as "special" fields that the API returns only when the request asks for them with the `special` parameter. This server never sends that parameter, and the answer is parsed with a schema per resource that drops every field it does not name, so those fields (and address and gender) are left out even if a portal returns them. The employee search refuses digits, because Planday also matches the search text against the CPR number and the salary identifier. Shift wages (`defaultWage`), shift type pay fields and position revenue fields are left out the same way. The audit log keeps ids, dates and times, never a name, a search or a comment.
+Planday holds an employee's CPR number (`ssn`), bank account and birth date as "special" fields that the API returns only when the request asks for them with the `special` parameter; this server never sends that parameter. The salary identifier, address and gender are ordinary fields that come with every employee. What protects all of them is the schema: every answer is parsed with a schema per resource that drops every field it does not name, and none of these is named, so they are left out even when a portal returns them. The employee search refuses digits, because Planday also matches the search text against the CPR number and the salary identifier. Shift wages (`defaultWage`), shift type pay fields and position revenue fields are left out the same way. The audit log keeps ids, dates and times, never a name, a search or a comment.
 
 ## Getting the app's credentials
 

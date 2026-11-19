@@ -52,7 +52,7 @@ const paging = z.object({ offset: z.number().int().min(0), limit: z.number().int
 const department = z.object({ id, name: text(500).nullable().optional(), number: text(100).nullable().optional() });
 const employeeGroup = z.object({ id, name: text(500).nullable().optional() });
 
-/** The work fields of an employee. CPR (ssn), bank account, birth date, salary identifier, address and gender are not here. */
+/** The work fields of an employee. CPR (ssn), bank account, birth date (special fields), salary identifier, address and gender (ordinary fields) are not here, so the parse drops them. */
 const employee = z.object({
   id,
   firstName: text(200).nullable().optional(),
