@@ -1,0 +1,52 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.borgels/mcp-server-planday",
+  "title": "Planday",
+  "description": "Unofficial MCP server for the Planday API.",
+  "repository": {
+    "url": "https://github.com/borgels/mcp-server-planday",
+    "source": "github"
+  },
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "mcp-server-planday",
+      "version": "0.1.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "PLANDAY_API_KEY",
+          "description": "API key for the Planday API.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "PLANDAY_BASE_URL",
+          "description": "Base URL of the Planday API.",
+          "isRequired": true,
+          "placeholder": "https://api.vendor.test/v1"
+        },
+        {
+          "name": "PLANDAY_ENABLE_WRITES",
+          "description": "Enable the write tools.",
+          "format": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "PLANDAY_DISABLED_TOOLS",
+          "description": "Comma-separated tool names to disable."
+        },
+        {
+          "name": "PLANDAY_AUDIT_LOG",
+          "description": "Path of the JSONL audit log. Write tools refuse to run if it cannot be written.",
+          "format": "filepath"
+        }
+      ]
+    }
+  ]
+}
