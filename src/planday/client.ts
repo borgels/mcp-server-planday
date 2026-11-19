@@ -3,14 +3,32 @@ import { PlandayHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from
 import { USER_AGENT } from '../version.js';
 
 export interface PlandayClientOptions {
-  /** API key. When omitted, read from PLANDAY_API_KEY in `credentialEnv`. */
-  apiKey?: string;
-  /** API base URL. When omitted, read from PLANDAY_BASE_URL in `credentialEnv`. */
-  baseUrl?: string;
   /**
-   * Where omitted credentials (apiKey, baseUrl) are read from. Defaults to
-   * process.env for the standalone server. The gateway passes `{}`, so an
-   * embedded instance only ever uses the credentials it was given.
+   * The app's client id: the "App Id" column under Settings > Integrations >
+   * API Access in Planday. Sent as X-ClientId and in the token request. Not
+   * a secret. When omitted, read from PLANDAY_CLIENT_ID in `credentialEnv`.
+   */
+  clientId?: string;
+  /**
+   * The refresh token: the "Token" column of the authorized app. A secret.
+   * When omitted, read from PLANDAY_REFRESH_TOKEN in `credentialEnv`.
+   */
+  refreshToken?: string;
+  /**
+   * Called when the token endpoint answers with a refresh token that differs
+   * from the one in use. Planday documents that refresh tokens do not expire
+   * and does not document rotation; if it rotates one, the client uses the
+   * new one from then on, and a host that stores tokens can save it here.
+   */
+  onRefreshToken?: (refreshToken: string) => void | Promise<void>;
+  /** API base URL (default https://openapi.planday.com; env PLANDAY_BASE_URL). */
+  baseUrl?: string;
+  /** Token endpoint (default https://id.planday.com/connect/token; env PLANDAY_TOKEN_URL). */
+  tokenUrl?: string;
+  /**
+   * Where omitted credentials are read from. Defaults to process.env for the
+   * standalone server. The gateway passes `{}`, so an embedded instance only
+   * ever uses the credentials it was given.
    */
   credentialEnv?: Env;
   fetchImpl?: typeof fetch;
@@ -30,25 +48,48 @@ export interface PlandayClientOptions {
    * the response is returned to the caller instead.
    */
   retryBudgetMs?: number;
-  /** Allow a base URL outside UPSTREAM_HOST_SUFFIXES (env PLANDAY_ALLOW_CUSTOM_BASE_URL=true). */
+  /** Allow hosts other than Planday's (env PLANDAY_ALLOW_CUSTOM_BASE_URL=true). Loopback http is always allowed for mocks. */
   allowCustomBaseUrl?: boolean;
   /** Injectable for tests. */
   sleep?: (ms: number) => Promise<void>;
+  /** Injectable for tests: the clock used for the access token's lifetime. */
+  now?: () => number;
 }
 
-export type QueryValue = string | number | boolean | null | undefined;
+export type QueryValue = string | number | boolean | null | undefined | readonly (string | number)[];
 
-type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
-
-/** Header that carries the API key. Change it to match the upstream API; error text redaction follows it. */
-export const API_KEY_HEADER = 'X-API-Key';
+type HttpMethod = 'GET' | 'POST' | 'PUT';
 
 /**
- * Hosts the API key may be sent to (exact host or any subdomain), e.g.
- * ['api.vendor.com']. Empty: any https host. Loopback http is always allowed
- * for local mocks.
+ * The header that carries the access token ("Authorization: Bearer ...",
+ * https://developer.planday.com/gettingstarted/authorization/); error text
+ * redaction follows it.
  */
-export const UPSTREAM_HOST_SUFFIXES: readonly string[] = [];
+export const API_KEY_HEADER = 'Authorization';
+
+/** The header that carries the client id on every API request (same page). */
+export const CLIENT_ID_HEADER = 'X-ClientId';
+
+/** The API host and the token host from Planday's documentation (exact host match, no subdomains). */
+export const API_HOST = 'openapi.planday.com';
+export const TOKEN_HOST = 'id.planday.com';
+
+export const DEFAULT_BASE_URL = `https://${API_HOST}`;
+export const DEFAULT_TOKEN_URL = `https://${TOKEN_HOST}/connect/token`;
+
+/**
+ * The only writes the client sends: method and path (relative to the base
+ * URL). Anything else, a DELETE among them, is refused before it is sent,
+ * whatever a tool or a policy says. The client has no delete method at all.
+ */
+export const ALLOWED_WRITES: ReadonlyArray<{ method: 'POST' | 'PUT'; path: RegExp }> = [
+  { method: 'POST', path: /^\/scheduling\/v1\.0\/shifts$/ },
+  { method: 'POST', path: /^\/scheduling\/v1\.0\/shifts\/\d+\/employee$/ },
+  { method: 'POST', path: /^\/scheduling\/v1\.0\/shifts\/\d+\/requests\/\d+\/approve$/ },
+];
+
+/** An access token is renewed this long before it expires. */
+const TOKEN_EARLY_RENEWAL_MS = 60_000;
 
 export const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 const MAX_RESPONSE_BYTES_LIMIT = 100 * 1024 * 1024;
@@ -103,7 +144,7 @@ const TRANSIENT_NETWORK_CODES = new Set([
 export interface UpstreamClient {
   get<T>(path: string, query?: Record<string, QueryValue>): Promise<T>;
   post<T>(path: string, body?: unknown, query?: Record<string, QueryValue>): Promise<T>;
-  patch<T>(path: string, body?: unknown): Promise<T>;
+  put<T>(path: string, body?: unknown): Promise<T>;
 }
 
 /**
@@ -118,27 +159,50 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
   return {
     get: (path, query) => client.get(path, query),
     post: refuse('POST'),
-    patch: refuse('PATCH'),
+    put: refuse('PUT'),
   };
 }
 
+/** The token endpoint refused the refresh token or the client id: our own text, nothing of the answer. */
+export class PlandayTokenError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super(
+      `Planday refused the app's token (HTTP ${status}). The app may have been removed or its access withdrawn; ` +
+        'an administrator authorizes it again under Settings > Integrations > API Access and copies the new token.',
+    );
+    this.name = 'PlandayTokenError';
+    this.status = status;
+  }
+}
+
 /**
- * Client for the upstream API. Authenticates with a single API key header.
+ * Client for the Planday Open API. Authenticates with OAuth: the app's
+ * refresh token is exchanged at the token endpoint for an access token
+ * (documented lifetime one hour), which is sent as a Bearer token with the
+ * client id in X-ClientId. The access token is kept in memory, renewed a
+ * minute before it expires, and renewed once when the API answers 401.
  *
- * Redirects are never followed, so the key cannot be forwarded to another
+ * Redirects are never followed, so no token can be forwarded to another
  * origin. Idempotent GETs are retried with backoff on throttling, gateway
  * errors and transient network failures; other methods are never retried.
- * A missing API key or base URL only fails when a request is made, so the
- * tool list can be read without credentials.
+ * Missing credentials only fail when a request is made, so the tool list can
+ * be read without credentials.
  *
- * Each client owns a SecretRedactor holding its own key and key header;
- * errors raised by the client, and the audit and tool results of calls
- * made through it, are redacted with it.
+ * Each client owns a SecretRedactor holding its refresh token and the
+ * access token in use; errors raised by the client, and the audit and tool
+ * results of calls made through it, are redacted with it.
  */
 export class PlandayClient implements UpstreamClient {
   readonly redactor: SecretRedactor;
-  private readonly apiKey?: string;
-  readonly baseUrl?: string;
+  readonly clientId?: string;
+  private refreshToken?: string;
+  private readonly onRefreshToken?: (refreshToken: string) => void | Promise<void>;
+  readonly baseUrl: string;
+  private readonly tokenUrl: string;
+  private access?: { token: string; expiresAt: number };
+  private readonly retired: string[] = [];
+  private pendingToken?: Promise<string>;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
@@ -147,19 +211,19 @@ export class PlandayClient implements UpstreamClient {
   private readonly retryBudgetMs: number;
   private readonly semaphore: Semaphore;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly now: () => number;
 
   constructor(options: PlandayClientOptions = {}) {
     const credentialEnv = options.credentialEnv ?? process.env;
-    this.apiKey = options.apiKey ?? readEnvString('PLANDAY_API_KEY', credentialEnv);
-    this.redactor = new SecretRedactor().addHeader(API_KEY_HEADER).addSecret(this.apiKey);
-    const baseUrl = options.baseUrl ?? readEnvString('PLANDAY_BASE_URL', credentialEnv);
-    if (baseUrl !== undefined) {
-      this.baseUrl = trimTrailingSlash(baseUrl);
-      assertSafeBaseUrl(
-        this.baseUrl,
-        options.allowCustomBaseUrl ?? readEnvBoolean('PLANDAY_ALLOW_CUSTOM_BASE_URL', false),
-      );
-    }
+    this.clientId = options.clientId ?? readEnvString('PLANDAY_CLIENT_ID', credentialEnv);
+    this.refreshToken = options.refreshToken ?? readEnvString('PLANDAY_REFRESH_TOKEN', credentialEnv);
+    this.onRefreshToken = options.onRefreshToken;
+    this.redactor = new SecretRedactor().addHeader(API_KEY_HEADER).addSecret(this.refreshToken);
+    const allowCustom = options.allowCustomBaseUrl ?? readEnvBoolean('PLANDAY_ALLOW_CUSTOM_BASE_URL', false);
+    this.baseUrl = trimTrailingSlash(options.baseUrl ?? readEnvString('PLANDAY_BASE_URL', credentialEnv) ?? DEFAULT_BASE_URL);
+    assertSafeUrl(this.baseUrl, API_HOST, 'PLANDAY_BASE_URL', allowCustom);
+    this.tokenUrl = options.tokenUrl ?? readEnvString('PLANDAY_TOKEN_URL', credentialEnv) ?? DEFAULT_TOKEN_URL;
+    assertSafeUrl(this.tokenUrl, TOKEN_HOST, 'PLANDAY_TOKEN_URL', allowCustom);
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'PLANDAY_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);
     this.maxResponseBytes = intOption(
@@ -170,13 +234,12 @@ export class PlandayClient implements UpstreamClient {
       1,
       MAX_RESPONSE_BYTES_LIMIT,
     );
-    this.semaphore = new Semaphore(
-      intOption('maxConcurrency', options.maxConcurrency, 'PLANDAY_MAX_CONCURRENCY', 4, 1, 64),
-    );
+    this.semaphore = new Semaphore(intOption('maxConcurrency', options.maxConcurrency, 'PLANDAY_MAX_CONCURRENCY', 4, 1, 64));
     this.maxAttempts = intOption('maxAttempts', options.maxAttempts, undefined, 3, 1, 10);
     this.retryBaseDelayMs = intOption('retryBaseDelayMs', options.retryBaseDelayMs, undefined, 500, 0, 60_000);
     this.retryBudgetMs = intOption('retryBudgetMs', options.retryBudgetMs, undefined, 10_000, 0, 600_000);
     this.sleep = options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+    this.now = options.now ?? Date.now;
   }
 
   async get<T>(path: string, query?: Record<string, QueryValue>): Promise<T> {
@@ -187,64 +250,159 @@ export class PlandayClient implements UpstreamClient {
     return this.request<T>('POST', this.buildUrl(path, query), body);
   }
 
-  async patch<T>(path: string, body?: unknown): Promise<T> {
-    return this.request<T>('PATCH', this.buildUrl(path), body);
+  async put<T>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>('PUT', this.buildUrl(path), body);
   }
 
+  /** A query value that is a list is sent as the parameter repeated, as the Open API takes arrays (e.g. departmentId). */
   buildUrl(path: string, query?: Record<string, QueryValue>): string {
-    if (!this.baseUrl) {
-      throw new Error('Missing PLANDAY_BASE_URL. Set it in the MCP server environment.');
-    }
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     const url = new URL(`${this.baseUrl}${normalizedPath}`);
-
     for (const [key, value] of Object.entries(query ?? {})) {
-      if (value === undefined || value === null || value === '') {
-        continue;
+      if (value === undefined || value === null || value === '') continue;
+      if (Array.isArray(value)) {
+        for (const item of value) url.searchParams.append(key, String(item));
+      } else {
+        url.searchParams.set(key, String(value));
       }
-      url.searchParams.set(key, String(value));
     }
-
     return url.toString();
   }
 
-  private headers(): Record<string, string> {
-    if (!this.apiKey) {
-      throw new Error('Missing PLANDAY_API_KEY. Set it in the MCP server environment.');
+  /** The access token in use, renewed when it is about to expire. One renewal at a time per client. */
+  private async accessToken(): Promise<string> {
+    if (this.access && this.access.expiresAt - TOKEN_EARLY_RENEWAL_MS > this.now()) return this.access.token;
+    this.pendingToken ??= this.renewAccessToken().finally(() => {
+      this.pendingToken = undefined;
+    });
+    return this.pendingToken;
+  }
+
+  /** Forget the access token (after a 401), so the next request renews it. */
+  private dropAccessToken(token: string): void {
+    if (this.access?.token === token) {
+      this.access = undefined;
     }
-    return {
-      Accept: 'application/json',
-      'User-Agent': USER_AGENT,
-      [API_KEY_HEADER]: this.apiKey,
+  }
+
+  /**
+   * POST the refresh token to the token endpoint, form-encoded, as the
+   * documentation shows: client_id, grant_type=refresh_token, refresh_token.
+   * The answer must hold an access_token; expires_in (seconds) sets its
+   * lifetime (one hour when absent, as documented).
+   */
+  private async renewAccessToken(): Promise<string> {
+    if (!this.clientId) throw new Error('Missing PLANDAY_CLIENT_ID. Set it in the MCP server environment.');
+    if (!this.refreshToken) throw new Error('Missing PLANDAY_REFRESH_TOKEN. Set it in the MCP server environment.');
+    const body = new URLSearchParams({ client_id: this.clientId, grant_type: 'refresh_token', refresh_token: this.refreshToken });
+    const init: RequestInit = {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'User-Agent': USER_AGENT, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
     };
+    const answer = await this.execute('POST', this.tokenUrl, init, async response => {
+      if (isRedirect(response.status)) {
+        await discardBody(response);
+        throw new Error(redirectRefusedMessage(response, 'POST', this.tokenUrl));
+      }
+      if (!response.ok) {
+        // The body is Planday's text: never read into an error.
+        await discardBody(response);
+        if (response.status === 400 || response.status === 401) throw new PlandayTokenError(response.status);
+        throw new PlandayHttpError({ status: response.status, url: describeUrl(this.tokenUrl), retryAfter: response.headers.get('retry-after') ?? undefined });
+      }
+      return readResponseBody(response, this.maxResponseBytes);
+    });
+    const value = answer && typeof answer === 'object' && !Array.isArray(answer) ? (answer as Record<string, unknown>) : {};
+    const token = value.access_token;
+    if (typeof token !== 'string' || !/^[\x21-\x7e]{16,8192}$/.test(token)) {
+      throw new Error('Planday answered the token request without an access token. Nothing in the answer was used.');
+    }
+    if (value.token_type !== undefined && (typeof value.token_type !== 'string' || value.token_type.toLowerCase() !== 'bearer')) {
+      throw new Error('Planday answered the token request with another token type than Bearer. Nothing in the answer was used.');
+    }
+    const expiresIn =
+      typeof value.expires_in === 'number' && Number.isInteger(value.expires_in) && value.expires_in > 0 && value.expires_in <= 86_400
+        ? value.expires_in
+        : 3_600;
+    // Earlier access tokens stay redacted for two renewals: one renewed early, or dropped after a 401, may still be
+    // valid, and errors in flight may hold it. Older ones have expired and are let go, so a long-running instance
+    // does not keep every token it ever had.
+    const previous = this.access?.token;
+    this.redactor.addSecret(token);
+    if (previous && previous !== token) {
+      this.retired.push(previous);
+      while (this.retired.length > 2) this.redactor.removeSecret(this.retired.shift() as string);
+    }
+    this.access = { token, expiresAt: this.now() + expiresIn * 1000 };
+    const rotated = value.refresh_token;
+    if (typeof rotated === 'string' && /^[\x21-\x7e]{16,8192}$/.test(rotated) && rotated !== this.refreshToken) {
+      // Not documented to happen; if it does, the new refresh token is used from now on, and both stay redacted.
+      this.redactor.addSecret(rotated);
+      this.refreshToken = rotated;
+      try {
+        const stored: unknown = this.onRefreshToken?.(rotated);
+        // A host that stores the token asynchronously: a rejected promise must not become an unhandled
+        // rejection (which ends a Node process). The token is in use in memory either way.
+        if (stored && typeof (stored as Promise<void>).then === 'function') {
+          (stored as Promise<void>).then(undefined, () => undefined);
+        }
+      } catch {
+        // A host's callback failing does not fail the call; the token is in use in memory.
+      }
+    }
+    return token;
   }
 
   private async request<T>(method: HttpMethod, url: string, body?: unknown): Promise<T> {
-    const headers = this.headers();
-    const init: RequestInit = { method, headers };
-    if (body !== undefined) {
-      headers['Content-Type'] = 'application/json';
-      init.body = JSON.stringify(body);
+    if (method !== 'GET') {
+      // The fixed list of writes: anything else is refused before any token is put in a header.
+      const path = new URL(url).pathname.slice(new URL(`${this.baseUrl}/`).pathname.length - 1);
+      if (!ALLOWED_WRITES.some(entry => entry.method === method && entry.path.test(path))) {
+        throw new Error(`Refused: ${method} to that Planday path is not among the writes this server sends.`);
+      }
     }
-
-    return this.execute(method, url, init, async response => {
-      if (isRedirect(response.status)) {
-        await discardBody(response);
-        throw new Error(this.redactor.redact(redirectRefusedMessage(response, method, url)));
+    if (!this.clientId) throw new Error('Missing PLANDAY_CLIENT_ID. Set it in the MCP server environment.');
+    // A 401 means the access token was not accepted and nothing was done: renew it once and send again.
+    for (let attempt = 1; ; attempt += 1) {
+      const token = await this.accessToken();
+      const headers: Record<string, string> = {
+        Accept: 'application/json',
+        'User-Agent': USER_AGENT,
+        [CLIENT_ID_HEADER]: this.clientId,
+        [API_KEY_HEADER]: `Bearer ${token}`,
+      };
+      const init: RequestInit = { method, headers };
+      if (body !== undefined) {
+        headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(body);
       }
-
-      if (!response.ok) {
-        // The body is the vendor's text: it is never read into an error, a result or an audit record.
-        await discardBody(response);
-        throw new PlandayHttpError({
-          status: response.status,
-          url: describeUrl(url),
-          retryAfter: response.headers.get('retry-after') ?? undefined,
-        });
+      const result = await this.execute(method, url, init, async response => {
+        if (isRedirect(response.status)) {
+          await discardBody(response);
+          throw new Error(this.redactor.redact(redirectRefusedMessage(response, method, url)));
+        }
+        if (response.status === 401 && attempt === 1) {
+          await discardBody(response);
+          return { unauthorised: true as const };
+        }
+        if (!response.ok) {
+          // The body is Planday's text: it is never read into an error, a result or an audit record.
+          await discardBody(response);
+          throw new PlandayHttpError({
+            status: response.status,
+            url: describeUrl(url),
+            retryAfter: response.headers.get('retry-after') ?? undefined,
+          });
+        }
+        return { body: (await readResponseBody(response, this.maxResponseBytes)) as T };
+      });
+      if ('unauthorised' in result) {
+        this.dropAccessToken(token);
+        continue;
       }
-
-      return (await readResponseBody(response, this.maxResponseBytes)) as T;
-    });
+      return result.body;
+    }
   }
 
   /**
@@ -389,7 +547,7 @@ function isRedirect(status: number): boolean {
 function redirectRefusedMessage(response: Response, method: HttpMethod, _url: string): string {
   return (
     `Planday API responded with a redirect (HTTP ${response.status}) for ${method}; ` +
-    'redirects are not followed. Check PLANDAY_BASE_URL.'
+    'redirects are not followed. Check PLANDAY_BASE_URL and PLANDAY_TOKEN_URL.'
   );
 }
 
@@ -509,43 +667,28 @@ function trimTrailingSlash(value: string): string {
   return value.slice(0, end);
 }
 
-function assertSafeBaseUrl(baseUrl: string, allowCustomHost: boolean): void {
+/**
+ * A URL a token may be sent to: https on exactly `host` (Planday's documented
+ * host for it), no credentials, query or fragment. Loopback http is allowed
+ * for local mocks; another host only with allowCustomHost. The value is
+ * never quoted: it is configuration.
+ */
+function assertSafeUrl(value: string, host: string, name: string, allowCustomHost: boolean): void {
   let parsed: URL;
   try {
-    parsed = new URL(baseUrl);
+    parsed = new URL(value);
   } catch {
-    throw new ConfigError('PLANDAY_BASE_URL is not a valid URL.');
+    throw new ConfigError(`${name} is not a valid URL.`);
   }
-
-  if (parsed.username || parsed.password || baseUrl.includes('?') || baseUrl.includes('#')) {
-    throw new ConfigError('PLANDAY_BASE_URL must not contain credentials, a query string or a fragment.');
+  if (parsed.username || parsed.password || value.includes('?') || value.includes('#')) {
+    throw new ConfigError(`${name} must not contain credentials, a query string or a fragment.`);
   }
-
-  if (isLocalHost(parsed.hostname) && (parsed.protocol === 'http:' || parsed.protocol === 'https:')) {
-    return;
-  }
-
+  if (isLocalHost(parsed.hostname) && (parsed.protocol === 'http:' || parsed.protocol === 'https:')) return;
   if (parsed.protocol !== 'https:') {
-    throw new ConfigError(
-      // The scheme is not quoted: it is part of a configuration value.
-      'Refusing to send the API key over a scheme other than https://. Use https:// (loopback http:// is allowed for local mocks).',
-    );
+    throw new ConfigError(`Refusing to send a token over a scheme other than https://. ${name} must use https://.`);
   }
-
-  const host = parsed.hostname.toLowerCase();
-  if (
-    UPSTREAM_HOST_SUFFIXES.length === 0 ||
-    allowCustomHost ||
-    UPSTREAM_HOST_SUFFIXES.some(suffix => host === suffix || host.endsWith(`.${suffix}`))
-  ) {
-    return;
-  }
-
-  // The host is not quoted: it is a configuration value.
-  throw new ConfigError(
-    `Refusing to send the API key to that host: PLANDAY_BASE_URL must be on ${UPSTREAM_HOST_SUFFIXES.join(', ')}. ` +
-      'Set PLANDAY_ALLOW_CUSTOM_BASE_URL=true to allow another host.',
-  );
+  if (parsed.hostname.toLowerCase() === host || allowCustomHost) return;
+  throw new ConfigError(`Refusing to send a token to that host: ${name} must be on ${host}. Set PLANDAY_ALLOW_CUSTOM_BASE_URL=true to allow another host.`);
 }
 
 function isLocalHost(hostname: string): boolean {

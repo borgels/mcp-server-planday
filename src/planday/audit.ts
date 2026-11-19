@@ -136,14 +136,34 @@ function errorFields(summary: ReturnType<typeof auditErrorSummary>) {
   return { httpStatus: summary.httpStatus, error: summary.message };
 }
 
-/** Identifier fields logged in clear text: they are opaque ids, not secrets. Extend per tool. */
-const ID_FIELDS = ['itemId'] as const;
+/** Fields logged in clear text: Planday ids, dates, times, statuses and flags. Input is validated before it is audited. */
+const ID_FIELDS = [
+  'employeeId',
+  'shiftId',
+  'departmentId',
+  'departmentIds',
+  'employeeGroupId',
+  'positionId',
+  'shiftTypeId',
+  'status',
+  'activeOnly',
+  'date',
+  'startTime',
+  'endTime',
+  'from',
+  'to',
+  'offset',
+  'limit',
+] as const;
 
-/** Free-text fields are hashed so user-written text does not land in the log. */
-const FREE_TEXT_FIELDS = ['name', 'query'] as const;
+/**
+ * No free text is logged, not even hashed: an employee search is a name or an
+ * e-mail address, a comment is written by a person.
+ */
+const FREE_TEXT_FIELDS = [] as const;
 
-/** Write payload objects: only their field names are logged. */
-const PAYLOAD_FIELDS = ['body', 'patch'] as const;
+/** Nothing is logged as a list count in this server. */
+const LIST_FIELDS = [] as const;
 
 /** Build the audit `target` for a tool input. Values not listed above are not logged. */
 export function auditTarget(input: unknown): Record<string, unknown> | undefined {
@@ -166,10 +186,9 @@ export function auditTarget(input: unknown): Record<string, unknown> | undefined
     }
   }
 
-  for (const field of PAYLOAD_FIELDS) {
-    const payload = value[field];
-    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-      target[`${field}Fields`] = Object.keys(payload).sort();
+  for (const field of LIST_FIELDS) {
+    if (Array.isArray(value[field])) {
+      target[`${field}Count`] = (value[field] as unknown[]).length;
     }
   }
 

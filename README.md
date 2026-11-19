@@ -1,11 +1,12 @@
 # mcp-server-planday
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server for the Planday API. It lets an MCP client (Claude or any other MCP-capable assistant) read data from the Planday API and, when enabled, write to it.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for the [Planday Open API](https://openapi.planday.com). It lets an MCP client (Claude or any other MCP-capable assistant) read a Planday portal's departments, employees, schedule and punch clock and, when enabled, create draft shifts, assign shifts and approve shift requests.
 
-> This is an independent, unofficial project. It is not developed, endorsed or supported by &lt;Vendor&gt;.
+> This is an independent, unofficial project. It is not developed, endorsed or supported by Planday.
 
 - Read-only by default; writes are opt-in per instance.
-- One set of upstream credentials per server instance; the server does no per-user authorization itself (see [Security model](#security-model)).
+- One Planday app (client id and refresh token) per server instance; the server does no per-user authorization itself (see [Security model](#security-model)).
+- Careful with personal data: no CPR number, bank account, birth date, salary identifier, address or gender is ever asked for or passed on, and no wage or pay field (see [Personal data](#personal-data)).
 - Two transports: stdio for local clients, stateless streamable HTTP for containers and gateways.
 - Embeddable: the `./gateway` export exposes the same tools, validation, policy and audit to a host application.
 
@@ -13,12 +14,36 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for the Pland
 
 | Tool | Purpose |
 |---|---|
-| `planday_get_item` | Fetch one item by id. |
-| `planday_create_item` *(write)* | Create an item. |
+| `planday_check_connection` | Check that the app's token works; the number of departments. |
+| `planday_list_departments` | Departments (id, name, number). |
+| `planday_list_employee_groups` | Employee groups (id, name). |
+| `planday_list_employees` | Active employees, 50 at a time: name, job title, work e-mail and phone, departments, groups, hired date. Search by name or e-mail (no digits). |
+| `planday_get_employee` | One employee, with the same work fields. |
+| `planday_list_shifts` | Shifts between two dates (at most 62 days), filtered by department, employee, group or status. No wages. |
+| `planday_get_shift` | One shift. |
+| `planday_list_shift_types` | Shift types, without pay fields. |
+| `planday_list_positions` | Positions, without revenue fields. |
+| `planday_list_shift_requests` | Shifts employees have asked to take, for the departments given. |
+| `planday_list_punch_clock_records` | Punch clock records between two dates (at most 62 days). |
+| `planday_create_shift` *(write)* | Create a shift as a draft (`isDraft` true, `allowConflicts` false, the department's break rules, no wage). The answer must be the shift asked for. |
+| `planday_assign_shift` *(write)* | Give a shift to an employee, or make it open; the shift is read back to confirm. |
+| `planday_approve_shift_request` *(write)* | Approve an employee's request for a shift, with no SMS or message; the shift is read back to confirm. |
+
+No tool deletes, publishes a schedule, approves punch clock records for payroll, swaps shifts, punches in or out, changes an employee, or reads or sets a wage. The client sends only the three writes above (a fixed list in `src/planday/client.ts`).
+
+### Personal data
+
+Planday holds an employee's CPR number (`ssn`), bank account and birth date as "special" fields that the API returns only when the request asks for them with the `special` parameter; this server never sends that parameter. The salary identifier, address and gender are ordinary fields that come with every employee. What protects all of them is the schema: every answer is parsed with a schema per resource that drops every field it does not name, and none of these is named, so they are left out even when a portal returns them. The employee search refuses digits, because Planday also matches the search text against the CPR number and the salary identifier. Shift wages (`defaultWage`), shift type pay fields and position revenue fields are left out the same way. The audit log keeps ids, dates and times, never a name, a search or a comment.
+
+## Getting the app's credentials
+
+An administrator creates an app in Planday under **Settings > Integrations > API Access**, chooses its scopes and authorizes it. The table then shows the app's **App Id** (the client id) and a **Token** (the refresh token). The server exchanges the refresh token for an access token (`POST https://id.planday.com/connect/token`, valid one hour) and renews it a minute before it expires. Planday documents that refresh tokens do not expire; if a new one ever comes back, it is used from then on (and handed to an embedding host through `onRefreshToken`).
+
+Give the app read access to departments, employees, employee groups, shifts, shift types, positions and punch clock records, and for the writes the right to create and update shifts and approve shift requests; nothing more.
 
 ## Quick start
 
-Requires Node.js 22 or later and an API key for the Planday API.
+Requires Node.js 22 or later and a Planday app's client id and refresh token.
 
 ```bash
 npx mcp-server-planday
@@ -37,7 +62,7 @@ Claude Code:
 
 ```bash
 claude mcp add planday \
-  --env PLANDAY_API_KEY=<key> --env PLANDAY_BASE_URL=<base url> \
+  --env PLANDAY_CLIENT_ID=<app id> --env PLANDAY_REFRESH_TOKEN=<token> \
   -- npx -y mcp-server-planday
 ```
 
@@ -50,8 +75,8 @@ Claude Desktop (`claude_desktop_config.json`), or any client that launches stdio
       "command": "npx",
       "args": ["-y", "mcp-server-planday"],
       "env": {
-        "PLANDAY_API_KEY": "<key>",
-        "PLANDAY_BASE_URL": "<base url>"
+        "PLANDAY_CLIENT_ID": "<app id>",
+        "PLANDAY_REFRESH_TOKEN": "<token>"
       }
     }
   }
@@ -65,8 +90,8 @@ Images are published to `ghcr.io/borgels/mcp-server-planday`: `latest` and the c
 ```bash
 TOKEN=$(openssl rand -hex 32); echo "$TOKEN"
 docker run -d --name planday-mcp -p 127.0.0.1:3000:3000 \
-  -e PLANDAY_API_KEY=<key> \
-  -e PLANDAY_BASE_URL=<base url> \
+  -e PLANDAY_CLIENT_ID=<app id> \
+  -e PLANDAY_REFRESH_TOKEN=<token> \
   -e MCP_HTTP_TOKEN="$TOKEN" \
   ghcr.io/borgels/mcp-server-planday:latest
 
@@ -86,9 +111,11 @@ Configuration is read from the environment (see `.env.example`). Invalid numbers
 
 | Variable | Default | Description |
 |---|---|---|
-| `PLANDAY_API_KEY` | – | **Required.** API key. |
-| `PLANDAY_BASE_URL` | – | **Required.** Base URL of the API. Must be `https` (loopback `http` is allowed for local mocks). |
-| `PLANDAY_ALLOW_CUSTOM_BASE_URL` | `false` | Allow a base URL outside the hosts the server expects, when such a list is configured. |
+| `PLANDAY_CLIENT_ID` | – | **Required.** The app's App Id. Sent as `X-ClientId` and in the token request; not a secret. |
+| `PLANDAY_REFRESH_TOKEN` | – | **Required.** The app's Token (refresh token). A secret. |
+| `PLANDAY_BASE_URL` | `https://openapi.planday.com` | API address. Must be on `openapi.planday.com` unless custom addresses are allowed (loopback `http` is allowed for local mocks). |
+| `PLANDAY_TOKEN_URL` | `https://id.planday.com/connect/token` | Token endpoint. Must be on `id.planday.com` unless custom addresses are allowed. |
+| `PLANDAY_ALLOW_CUSTOM_BASE_URL` | `false` | Allow addresses outside Planday's hosts. |
 | `PLANDAY_TIMEOUT_MS` | `30000` | Timeout per request attempt. |
 | `PLANDAY_MAX_CONCURRENCY` | `4` | Maximum concurrent upstream requests. |
 | `PLANDAY_MAX_RESPONSE_BYTES` | `10485760` | Largest response body read (at most 100 MB). |
@@ -99,7 +126,7 @@ Configuration is read from the environment (see `.env.example`). Invalid numbers
 |---|---|---|
 | `PLANDAY_ENABLE_WRITES` | `false` | Enable the write tools. |
 | `PLANDAY_DISABLED_TOOLS` | – | Comma-separated tool names to disable, with or without the `planday_` prefix. |
-| `PLANDAY_AUDIT_LOG` | – | Path of a JSONL audit log: one record per tool call start, finish and error, with ids in clear text, free text hashed, duration, status and the caller passed by an embedding host. Write tools refuse to run if the log cannot be written. |
+| `PLANDAY_AUDIT_LOG` | – | Path of a JSONL audit log: one record per tool call start, finish and error, with ids, dates and times in clear text and no free text at all, duration, status and the caller passed by an embedding host. Write tools refuse to run if the log cannot be written. |
 
 ### HTTP transport
 
@@ -122,19 +149,26 @@ A host application can run the tools in-process instead of over MCP:
 ```ts
 import { createPlandayGateway, plandayToolCatalog } from 'mcp-server-planday/gateway';
 
-const gateway = createPlandayGateway({ apiKey: tenant.apiKey, baseUrl: tenant.baseUrl });
-const result = await gateway.callTool('get_item', { itemId: 'i1' }, { caller: 'user@planday.test' });
+const gateway = createPlandayGateway({
+  clientId: tenant.plandayAppId,
+  refreshToken: tenant.plandayToken,
+  onRefreshToken: token => saveTenantToken(tenant, token),
+  policy: { enableWrites: false, audit: record => writeAudit(record), pseudonymKey: tenant.auditKey },
+});
+const result = await gateway.callTool('list_shifts', { from: '2026-11-01', to: '2026-11-30' }, { caller: 'user@example.test' });
 ```
 
-- **Explicit credentials.** `apiKey` and `baseUrl` are required; a missing value throws when the gateway is created. A gateway never reads `PLANDAY_API_KEY` or `PLANDAY_BASE_URL` from the environment, so one tenant cannot silently fall back to the process's credentials. The stdio and HTTP transports still read them from the environment.
-- **Several tenants in one process.** Create one gateway per set of credentials. Each instance redacts error text, tool results and audit records with its own key only; no secret is kept in a process-wide registry, and a dropped instance releases its key.
-- **Instance policy from the host.** Pass `policy` to `createPlandayGateway`: `enableWrites` (default false), `disabledTools` (must name known tools) and `audit`, a function that receives each audit record instead of `PLANDAY_AUDIT_LOG` (without it the instance writes no audit; a write tool does not run if the sink throws on its start record). An instance with `policy` reads none of `PLANDAY_ENABLE_WRITES`, `PLANDAY_DISABLED_TOOLS`, `PLANDAY_AUDIT_LOG` or `PLANDAY_ALLOW_CUSTOM_BASE_URL`, so tenants in one process can have different settings. Without `policy` the instance uses the environment, like the MCP server. Each call runs in a scope of its own, so a call made from inside another instance's call never inherits its policy, sink or redactor, and every audit record is redacted as a whole with the instance's own key before the sink sees it. The limits (`PLANDAY_TIMEOUT_MS`, ...) are still read from the environment and apply to every gateway in the process. Per-user and per-tenant authorization is the host's job.
+- **Explicit credentials.** `clientId` and `refreshToken` are required; a missing value throws when the gateway is created. A gateway never reads `PLANDAY_CLIENT_ID`, `PLANDAY_REFRESH_TOKEN`, `PLANDAY_BASE_URL` or `PLANDAY_TOKEN_URL` from the environment, so one tenant cannot silently fall back to the process's credentials. The stdio and HTTP transports still read them from the environment.
+- **Several tenants in one process.** Create one gateway per set of credentials. Each instance keeps its own access token in memory and redacts error text, tool results and audit records with its own refresh token, access tokens and pseudonym key only; no secret is kept in a process-wide registry, and a dropped instance releases its key.
+- **Instance policy from the host.** Pass `policy` to `createPlandayGateway`: `enableWrites` (default false), `disabledTools` (must name known tools), `pseudonymKey` (at least 32 random printable characters or 32 random bytes, admitted like the refresh token: a key that shares a piece of six characters with any text of this server is refused, so no error, fallback or tool description can carry part of it; the caller and request id in audit records become `hmac:` and 16 hex characters with it, else `sha256:`) and `audit`, a function that receives each audit record instead of `PLANDAY_AUDIT_LOG` (without it the instance writes no audit; a write tool does not run if the sink throws on its start record). An instance with `policy` reads none of `PLANDAY_ENABLE_WRITES`, `PLANDAY_DISABLED_TOOLS`, `PLANDAY_AUDIT_LOG` or `PLANDAY_ALLOW_CUSTOM_BASE_URL`, so tenants in one process can have different settings. Without `policy` the instance uses the environment, like the MCP server. Each call runs in a scope of its own, so a call made from inside another instance's call never inherits its policy, sink or redactor, and every audit record is redacted as a whole with the instance's own key before the sink sees it. The limits (`PLANDAY_TIMEOUT_MS`, ...) are still read from the environment and apply to every gateway in the process. Per-user and per-tenant authorization is the host's job.
 - **Result format.** A successful `callTool` result has `structuredContent` and one text block: a short summary, a blank line, and the same data as compact JSON, as the MCP specification recommends (many clients read only the text). The JSON is built from the redacted result, so it holds exactly `structuredContent`. An error result has only its text.
+- **Change resolution.** `resolvePlandayChange(tool, input, { pseudonymKey })` (or `gateway.resolveChange`) validates the input exactly as the call would, the tool's own checks included, and returns what a write call will change before it is sent, for a host that logs the change first: shift, department, employee, group, position and shift type ids, the date and the times; never the comment.
+- **Call context in the audit.** The `caller` and the `requestId` a host passes are never logged in clear: any text can hold a name, a phone number or an address, so both become pseudonyms (HMAC-SHA-256 with `policy.pseudonymKey`, else SHA-256), which still tie the lines of one call together for a host that knows the key. Without a request id the audit makes its own.
 - **Tool catalog.** `plandayToolCatalog` is a frozen list of every tool: `name` (without the `planday_` prefix), `title`, `description`, `riskLevel` (`read`, `write` or `destructive`), `enabledByDefault`, `inputSchema` (JSON Schema), `broad` (true when a tool can read more than its name says, so a host gives it only to roles that may read everything) and `upstream`, the API requests the tool may make (`access`, `method` and path template). It is generated from the same tool table as the MCP server, so it cannot drift from the registered tools. `plandayGatewayTools` holds the same definitions without `upstream` and `broad`; `gateway.tools` lists those enabled on the instance.
 
 ## Threat model
 
-What this server guarantees about the API key, and what it does not. It is
+What this server guarantees about the app's tokens (the refresh token, the access tokens it gets and the host's pseudonym key; "the key" below), and what it does not. It is
 the yardstick for every change that touches errors, results or audit.
 
 **Scope.** Guarantees (a), (b) and (c) apply to the embeddable gateway
@@ -179,7 +213,7 @@ construction error becomes the fixed refusal. Every error a gateway throws is a 
 closed set (`src/fallbacks.ts`), and a key that shares a piece with any of
 them, or with the tool list, is refused when the gateway is created.
 
-**Key admission.** Every key is a secret the vendor issues. A gateway
+**Key admission.** The refresh token is a secret Planday issues. A gateway
 accepts only printable ASCII (0x21-0x7E) of at least 16 characters, checked
 before anything is built from the key. As a cheap first filter it also
 refuses a key that shares a piece of 6 characters with a string literal in
@@ -190,12 +224,12 @@ on as the API returned them.
 
 ## Security model
 
-- **One shared identity.** Every caller acts with the rights of the configured API key. Give it the least rights that work and rotate it regularly.
+- **One shared identity.** Every caller acts with the rights of the configured Planday app. Give it the least access that works; an administrator can withdraw the app under Settings > Integrations > API Access at any time.
 - **Per-user authorization belongs in front of the server.** The server checks a single bearer token and does not know the end user. For multi-user use, run it behind an identity-aware gateway that decides which users may call which tools, holds the bearer token, and is the only network path to the server. Hosts can also embed the tools through the `./gateway` module export and pass the caller identity into the audit log.
-- **Tool access is not data access.** A gateway controls who may call which tool; every permitted caller still sees everything the API key can see. To separate data, run several instances with different keys.
+- **Tool access is not data access.** A gateway controls who may call which tool; every permitted caller still sees everything the Planday app can see. To separate data, run several instances with different apps.
 - **Writes are off by default.** Write tools are annotated as destructive so clients can ask for confirmation. Read-only tools get a client that refuses non-GET requests. When `PLANDAY_AUDIT_LOG` is set, a write tool does not run unless its start record is written; without it there is no audit record.
 - **Upstream content is untrusted input.** Data returned by the API may be written by anyone with access to it. Tool results label it as data; clients that combine this server with other tools should treat it accordingly.
-- **The API key stays on the API origin.** Redirects are never followed, the base URL must use `https`, and error messages and audit records are redacted (by each instance, with that instance's key) and size-capped. See the threat model above for what is and is not guaranteed.
+- **The tokens stay on Planday's hosts.** The refresh token goes only to `id.planday.com` and the access token only to `openapi.planday.com` (other hosts need an explicit switch), redirects are never followed, addresses must use `https`, and error messages and audit records are redacted (by each instance, with that instance's key) and size-capped. See the threat model above for what is and is not guaranteed.
 - **The HTTP transport fails closed.** It refuses to start on a non-loopback address or with any origin allowed unless a token is set, compares tokens in constant time, throttles failed authentication per client address, checks `Origin` and `Host` (DNS rebinding), and caps request bodies.
 
 Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
@@ -226,7 +260,11 @@ Project layout:
 2. Tag the merged commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 3. `release.yml` tests, packs and publishes the tarball to npm through trusted publishing (no stored token; npm adds provenance when the repository is public), then publishes `server.json` to the MCP Registry. Versions already on npm or in the registry are skipped, so a failed run can be re-run. Pre-release tags (`vX.Y.Z-rc.1`) go to the npm dist-tag `next` and not to the registry. `publish.yml` pushes the `vX.Y.Z` image.
 
-The first version of a new package is published by hand; see the header of `.github/workflows/release.yml` (and [docs/NEW-SERVER.md](docs/NEW-SERVER.md)).
+The first version of a new package is published by hand; see the header of `.github/workflows/release.yml`.
+
+## What is not tested against a live portal
+
+The tests use answers shaped as Planday's published OpenAPI documents show them (`https://openapi.planday.com/{hr,scheduling,punchclock}/swagger/v1.0/swagger.json`) and the token flow as the developer guide describes it. No Planday portal was used. Not verified live: the exact field set a portal returns for employees, shifts and punch clock records; that special fields stay out without the parameter; whether the token endpoint ever returns a new refresh token; and the answers of the assign and approve endpoints (documented without a body; the shift is read back instead).
 
 ## License
 
