@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { testClient } from './helpers.js';
 import { request as httpRequest } from 'node:http';
 import { type AddressInfo, connect, createServer as createNetServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
@@ -49,9 +50,8 @@ const mcpHeaders = {
 };
 
 function fakeMcpServer() {
-  const client = new PlandayClient({
-    apiKey: 'test',
-    baseUrl: 'https://api.vendor.test',
+  const client = testClient({
+    accessToken: 'test',
     fetchImpl: async () => {
       throw new Error('network access is not allowed in tests');
     },

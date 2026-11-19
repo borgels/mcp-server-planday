@@ -2,34 +2,33 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.borgels/mcp-server-planday",
   "title": "Planday",
-  "description": "Unofficial MCP server for the Planday API.",
+  "description": "Unofficial MCP server for the Planday Open API: departments, employees, schedule and punch clock.",
   "repository": {
     "url": "https://github.com/borgels/mcp-server-planday",
     "source": "github"
   },
-  "version": "0.1.1",
+  "version": "0.1.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "mcp-server-planday",
-      "version": "0.1.1",
+      "version": "0.1.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
-          "name": "PLANDAY_API_KEY",
-          "description": "API key for the Planday API.",
-          "isRequired": true,
-          "isSecret": true
+          "name": "PLANDAY_CLIENT_ID",
+          "description": "The Planday app's App Id (Settings > Integrations > API Access).",
+          "isRequired": true
         },
         {
-          "name": "PLANDAY_BASE_URL",
-          "description": "Base URL of the Planday API.",
+          "name": "PLANDAY_REFRESH_TOKEN",
+          "description": "The Planday app's Token (a refresh token).",
           "isRequired": true,
-          "placeholder": "https://api.vendor.test/v1"
+          "isSecret": true
         },
         {
           "name": "PLANDAY_ENABLE_WRITES",

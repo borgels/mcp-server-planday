@@ -6,8 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { UpstreamClient } from '../src/planday/client.js';
 import { createServer, getDefaultClient } from '../src/server.js';
 import { createPlandayGateway, plandayGatewayTools } from '../src/gateway.js';
-import { PLANDAY_TOOLS, executeTool, validateStartupConfig } from '../src/tools/planday.js';
-import { BASE, auditLines, connect, gateway, makeClient, texts } from './helpers.js';
+import { PLANDAY_TOOLS, executeTool, validateStartupConfig, pseudonym } from '../src/tools/planday.js';
+import { BASE, auditLines, connect, gateway, makeClient, texts, testGateway, SHIFT_CREATED } from './helpers.js';
 
 const originalEnv = { ...process.env };
 let dir: string;
@@ -26,7 +26,8 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const item = { id: 'i1', name: 'First item' };
+const item = { id: 12, firstName: 'First item' };
+const created = SHIFT_CREATED;
 
 describe('MCP tool surface', () => {
   it('registers every tool with matching annotations', async () => {
@@ -40,8 +41,8 @@ describe('MCP tool surface', () => {
   });
 
   it('runs the read tool and labels upstream content as data', async () => {
-    const { mcpClient, fetchImpl } = await connect({ [`GET ${BASE}/items/i1`]: { body: item } });
-    const result = await mcpClient.callTool({ name: 'planday_get_item', arguments: { itemId: 'i1' } });
+    const { mcpClient, fetchImpl } = await connect({ [`GET ${BASE}/hr/v1.0/employees/12`]: { body: { data: item } } });
+    const result = await mcpClient.callTool({ name: 'planday_get_employee', arguments: { employeeId: 12 } });
     expect(result.isError).toBeFalsy();
     const [json, note] = texts(result);
     expect(JSON.parse(json ?? '')).toEqual(item);
@@ -51,17 +52,18 @@ describe('MCP tool surface', () => {
 
   it('rejects unknown arguments and path traversal', async () => {
     const { mcpClient, fetchImpl } = await connect();
-    const extra = await mcpClient.callTool({ name: 'planday_get_item', arguments: { itemId: 'i1', other: 1 } });
+    const extra = await mcpClient.callTool({ name: 'planday_get_employee', arguments: { employeeId: 12, other: 1 } });
     expect(extra.isError).toBe(true);
-    const traversal = await mcpClient.callTool({ name: 'planday_get_item', arguments: { itemId: '..' } });
+    const traversal = await mcpClient.callTool({ name: 'planday_get_employee', arguments: { employeeId: -1 } });
     expect(traversal.isError).toBe(true);
-    expect(texts(traversal).join(' ')).toContain('Invalid itemId');
+    const slash = await mcpClient.callTool({ name: 'planday_get_employee', arguments: { employeeId: 'a/b' } });
+    expect(slash.isError).toBe(true);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('refuses the write tool unless writes are enabled, without calling upstream', async () => {
     const { mcpClient, fetchImpl } = await connect();
-    const result = await mcpClient.callTool({ name: 'planday_create_item', arguments: { name: 'New' } });
+    const result = await mcpClient.callTool({ name: 'planday_create_shift', arguments: { departmentId: 1, employeeGroupId: 2, date: '2026-11-20', startTime: '08:00', endTime: '16:00' } });
     expect(result.isError).toBe(true);
     expect(texts(result).join(' ')).toContain('PLANDAY_ENABLE_WRITES');
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -70,61 +72,71 @@ describe('MCP tool surface', () => {
   it('runs the write tool when enabled and audits it', async () => {
     process.env.PLANDAY_ENABLE_WRITES = 'true';
     process.env.PLANDAY_AUDIT_LOG = join(dir, 'audit.jsonl');
-    const { mcpClient, fetchImpl } = await connect({ [`POST ${BASE}/items`]: { status: 201, body: item } });
+    const { mcpClient, fetchImpl } = await connect({ [`POST ${BASE}/scheduling/v1.0/shifts`]: { status: 200, body: { data: created } } });
     const result = await mcpClient.callTool({
-      name: 'planday_create_item',
-      arguments: { name: 'First item', description: 'text' },
+      name: 'planday_create_shift',
+      arguments: { departmentId: 1, employeeGroupId: 2, date: '2026-11-20', startTime: '08:00', endTime: '16:00', comment: 'First item' },
     });
     expect(result.isError).toBeFalsy();
+    expect(JSON.parse(texts(result)[0] ?? '')).toEqual(created);
     const init = fetchImpl.mock.calls[0]?.[1];
-    expect(JSON.parse(String(init?.body))).toEqual({ name: 'First item', description: 'text' });
+    // A draft, without conflicts, with the department's break rules, and no wage.
+    expect(JSON.parse(String(init?.body))).toEqual({
+      allowConflicts: false,
+      useBreaks: true,
+      isDraft: true,
+      departmentId: 1, employeeGroupId: 2, date: '2026-11-20', startTime: '08:00', endTime: '16:00',
+      comment: 'First item',
+    });
 
     const lines = auditLines(process.env.PLANDAY_AUDIT_LOG);
     expect(lines.map(line => line.action)).toEqual(['start', 'finish']);
     expect(lines[0]?.requestId).toBe(lines[1]?.requestId);
-    // Free text is hashed, never logged in clear text.
+    // The comment is not logged at all; ids, the date and the times are.
     expect(JSON.stringify(lines)).not.toContain('First item');
-    expect((lines[0]?.target as Record<string, unknown>).nameSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(lines[0]?.target).toEqual({ departmentId: 1, employeeGroupId: 2, date: '2026-11-20', startTime: '08:00', endTime: '16:00' });
   });
 
   it('refuses an unwritable audit log path at startup, but not per server instance', async () => {
     process.env.PLANDAY_AUDIT_LOG = join(dir, 'missing-dir', 'audit.jsonl');
     expect(() => validateStartupConfig()).toThrow('PLANDAY_AUDIT_LOG');
-    expect(() => createPlandayGateway({ apiKey: 'tttt-gggg-wwww-vvvv-1', baseUrl: BASE })).toThrow('PLANDAY_AUDIT_LOG');
+    expect(() => testGateway({ accessToken: 'tttt-gggg-wwww-vvvv-1', baseUrl: BASE })).toThrow('PLANDAY_AUDIT_LOG');
 
     // The HTTP transport creates a server per request: read tools keep working.
-    const { mcpClient } = await connect({ [`GET ${BASE}/items/i1`]: { body: item } });
-    const result = await mcpClient.callTool({ name: 'planday_get_item', arguments: { itemId: 'i1' } });
+    const { mcpClient } = await connect({ [`GET ${BASE}/hr/v1.0/employees/12`]: { body: { data: item } } });
+    const result = await mcpClient.callTool({ name: 'planday_get_employee', arguments: { employeeId: 12 } });
     expect(result.isError).toBeFalsy();
   });
 
   it('fails closed when the audit log cannot be written before a write', async () => {
     process.env.PLANDAY_ENABLE_WRITES = 'true';
-    const { mcpClient, fetchImpl } = await connect({ [`POST ${BASE}/items`]: { body: item } });
+    const { mcpClient, fetchImpl } = await connect({ [`POST ${BASE}/scheduling/v1.0/shifts`]: { body: { data: created } } });
     // The log becomes unwritable after startup.
     process.env.PLANDAY_AUDIT_LOG = join(dir, 'missing-dir', 'audit.jsonl');
-    const result = await mcpClient.callTool({ name: 'planday_create_item', arguments: { name: 'x' } });
+    const result = await mcpClient.callTool({ name: 'planday_create_shift', arguments: { departmentId: 1, employeeGroupId: 2, date: '2026-11-20', startTime: '08:00', endTime: '16:00' } });
     expect(result.isError).toBe(true);
     expect(texts(result).join(' ')).toContain('Audit log is not writable');
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('removes disabled tools and refuses unknown names', async () => {
-    process.env.PLANDAY_DISABLED_TOOLS = 'create_item';
+    process.env.PLANDAY_DISABLED_TOOLS = 'create_shift,planday_get_employee';
     const { mcpClient } = await connect();
     const { tools } = await mcpClient.listTools();
-    expect(tools.map(t => t.name)).toEqual(['planday_get_item']);
+    expect(tools.map(t => t.name)).not.toContain('planday_create_shift');
+    expect(tools.map(t => t.name)).not.toContain('planday_get_employee');
+    expect(tools).toHaveLength(PLANDAY_TOOLS.length - 2);
 
     process.env.PLANDAY_DISABLED_TOOLS = 'no_such_tool';
-    expect(() => createServer({ clientOptions: { apiKey: 'k' } })).toThrow('PLANDAY_DISABLED_TOOLS');
+    expect(() => createServer({ clientOptions: { clientId: 'c', refreshToken: 'k' } })).toThrow('PLANDAY_DISABLED_TOOLS');
   });
 
   it('logs only a summary of upstream errors', async () => {
     process.env.PLANDAY_AUDIT_LOG = join(dir, 'audit.jsonl');
     const { mcpClient } = await connect({
-      [`GET ${BASE}/items/i1`]: { status: 400, body: { message: 'bad value: jane@vendor.test' } },
+      [`GET ${BASE}/hr/v1.0/employees/12`]: { status: 400, body: { message: 'bad value: jane@vendor.test' } },
     });
-    const result = await mcpClient.callTool({ name: 'planday_get_item', arguments: { itemId: 'i1' } });
+    const result = await mcpClient.callTool({ name: 'planday_get_employee', arguments: { employeeId: 12 } });
     expect(result.isError).toBe(true);
     const lines = auditLines(process.env.PLANDAY_AUDIT_LOG);
     expect(lines.at(-1)).toMatchObject({ action: 'error', httpStatus: 400 });
@@ -138,23 +150,23 @@ describe('write gate beyond annotations', () => {
     const client = makeClient(fetchImpl);
     const misannotated = {
       ...PLANDAY_TOOLS[0]!,
-      name: 'planday_get_item',
-      handler: async (c: UpstreamClient) => c.post('/items', { name: 'x' }),
+      name: 'planday_get_employee',
+      handler: async (c: UpstreamClient) => c.post('/contacts', { name: 'x' }),
     };
-    await expect(executeTool(misannotated, client, { itemId: 'i1' })).rejects.toThrow(/Read-only tool .* POST/);
+    await expect(executeTool(misannotated, client, { employeeId: 12 })).rejects.toThrow(/Read-only tool .* POST/);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('redacts error text centrally on the MCP path', async () => {
     // A handler that throws a raw, unredacted error.
-    const tool = PLANDAY_TOOLS.find(t => t.name === 'planday_get_item')!;
+    const tool = PLANDAY_TOOLS.find(t => t.name === 'planday_get_employee')!;
     const original = tool.handler;
     tool.handler = async () => {
-      throw new Error('failed: key test-api-key, header X-API-Key: other-secret, {"apiKey":"third-secret"}');
+      throw new Error('failed: key test-api-key, header Authorization: Bearer other-secret, {"refresh_token":"third-secret"}');
     };
     try {
       const { mcpClient } = await connect();
-      const result = await mcpClient.callTool({ name: 'planday_get_item', arguments: { itemId: 'i1' } });
+      const result = await mcpClient.callTool({ name: 'planday_get_employee', arguments: { employeeId: 12 } });
       expect(result.isError).toBe(true);
       const text = texts(result).join(' ');
       expect(text).toContain('‹redacted›');
@@ -169,9 +181,17 @@ describe('write gate beyond annotations', () => {
 
 describe('gateway export', () => {
   it('exposes tools without the prefix and with valid JSON Schemas', () => {
-    expect(plandayGatewayTools.map(t => [t.name, t.riskLevel, t.enabledByDefault])).toEqual([
-      ['get_item', 'read', true],
-      ['create_item', 'destructive', false],
+    for (const tool of plandayGatewayTools) {
+      expect(tool.name.startsWith('planday_')).toBe(false);
+      // Reads are on by default; writes are 'write' (none deletes) and off by default.
+      expect([tool.riskLevel, tool.enabledByDefault]).toEqual(
+        tool.riskLevel === 'read' ? ['read', true] : ['write', false],
+      );
+    }
+    expect(plandayGatewayTools.filter(t => t.riskLevel === 'write').map(t => t.name)).toEqual([
+      'create_shift',
+      'assign_shift',
+      'approve_shift_request',
     ]);
     const ajv = new Ajv({ strict: true });
     for (const tool of plandayGatewayTools) {
@@ -181,22 +201,23 @@ describe('gateway export', () => {
 
   it('validates input, applies the policy and records the caller', async () => {
     process.env.PLANDAY_AUDIT_LOG = join(dir, 'audit.jsonl');
-    const { gw, fetchImpl } = gateway({ [`GET ${BASE}/items/i1`]: { body: item } });
+    const { gw, fetchImpl } = gateway({ [`GET ${BASE}/hr/v1.0/employees/12`]: { body: { data: item } } });
 
-    const ok = await gw.callTool('get_item', { itemId: 'i1' }, { caller: 'user@vendor.test', requestId: 'req-1' });
+    const ok = await gw.callTool('get_employee', { employeeId: 12 }, { caller: 'user@vendor.test', requestId: 'req-1' });
     expect(ok.isError).toBeUndefined();
     expect(ok.structuredContent).toEqual(item);
 
-    const invalid = await gw.callTool('get_item', { itemId: 'i1', extra: true });
+    const invalid = await gw.callTool('get_employee', { employeeId: 12, extra: true });
     expect(invalid.isError).toBe(true);
     const unknown = await gw.callTool('delete_everything', {});
     expect(unknown.isError).toBe(true);
-    const write = await gw.callTool('create_item', { name: 'x' });
+    const write = await gw.callTool('create_shift', { departmentId: 1, employeeGroupId: 2, date: '2026-11-20', startTime: '08:00', endTime: '16:00', comment: 'x' });
     expect(write.isError).toBe(true);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
 
     const lines = auditLines(process.env.PLANDAY_AUDIT_LOG);
-    expect(lines[0]).toMatchObject({ requestId: 'req-1', caller: 'user@vendor.test', action: 'start' });
+    expect(lines[0]).toMatchObject({ requestId: pseudonym('req-1'), caller: expect.stringMatching(/^sha256:[0-9a-f]{16}$/), action: 'start' });
+    expect(JSON.stringify(lines)).not.toContain('user@vendor.test');
     expect(lines.map(line => line.action)).toEqual(['start', 'finish', 'rejected', 'rejected', 'policy_denied']);
   });
 });

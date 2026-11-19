@@ -17,7 +17,12 @@ import {
   PLANDAY_TOOLS,
   executeTool,
   findTool,
+  logFieldValue,
+  validateCall,
   validateStartupConfig,
+  type PlandayChangeAction,
+  type PlandayChangeRecord,
+  type PlandayChangeSpec,
   type CallContext,
   type ToolDefinition,
   type UpstreamOperation,
@@ -30,10 +35,13 @@ import {
  * instance policy and audit are shared with the MCP server in
  * src/tools/planday.ts.
  *
- * Several gateway instances (for planday one per tenant) can run in one
- * process. Each instance uses only the credentials passed to
- * createPlandayGateway (never PLANDAY_API_KEY or PLANDAY_BASE_URL from the
- * environment) and redacts errors with its own secrets only.
+ * One instance per Planday portal: an app's token is tied to the portal it
+ * was authorized in ("there needs to be an unique (Refresh) Token from each
+ * of the portals", https://developer.planday.com/gettingstarted/authorization/).
+ * Several instances can run in one process. Each instance uses only the
+ * credentials passed to createPlandayGateway (never PLANDAY_CLIENT_ID,
+ * PLANDAY_REFRESH_TOKEN or the URLs from the environment) and redacts errors
+ * with its own secrets only.
  *
  * Instance policy (writes, disabled tools, audit) comes from the host when it
  * passes `policy`: that instance then reads none of PLANDAY_ENABLE_WRITES,
@@ -42,9 +50,21 @@ import {
  * `policy` the instance uses the environment, as the MCP server does. Limits
  * (timeouts, retries) are still read from the environment and apply to every
  * instance.
+ *
+ * What no policy can turn on: a request outside the client's fixed list of
+ * writes (src/planday/client.ts, ALLOWED_WRITES). There is no DELETE, and no
+ * tool that reads or changes wages, pay rates, salary codes, CPR numbers,
+ * bank accounts or birth dates, or changes an employee.
  */
 
 export type { AuditSink, InstancePolicy } from './planday/policy.js';
+export type {
+  PlandayChangeAction,
+  PlandayChangeRecord,
+  PlandayChangeSpec,
+  PlandayLogField,
+  PlandayLogFieldType,
+} from './tools/planday.js';
 
 export type GatewayRiskLevel = 'read' | 'write' | 'destructive';
 export type GatewayJsonValue = string | number | boolean | null | GatewayJsonValue[] | { [key: string]: GatewayJsonValue };
@@ -95,13 +115,27 @@ export interface GatewayToolCatalogEntry {
    * (`broad`), false unless a tool declares it.
    */
   readonly broad: boolean;
+  /**
+   * True for a tool a person should confirm outside the chat before it runs.
+   * False for every tool here: none moves money.
+   */
+  readonly requiresConfirmation: boolean;
+  /**
+   * Write tools only: what the change does, for a host that logs a change
+   * before it is sent. `logFields` are the input fields that identify it,
+   * each with the one type its value must have (Planday record ids, dates,
+   * currency codes, dates, counts, flags and kinds in clear; numbers the
+   * company chose only as pseudonyms; never names or free text).
+   * `resolvePlandayChange` returns their values.
+   */
+  readonly change?: PlandayChangeSpec;
 }
 
-export interface PlandayGatewayOptions extends Omit<PlandayClientOptions, 'apiKey' | 'baseUrl' | 'credentialEnv'> {
-  /** API key of this instance. Required; never read from the environment. */
-  apiKey: string;
-  /** API base URL of this instance. Required; never read from the environment. */
-  baseUrl: string;
+export interface PlandayGatewayOptions extends Omit<PlandayClientOptions, 'clientId' | 'refreshToken' | 'credentialEnv'> {
+  /** The app's client id (App Id under Settings > Integrations > API Access). Required; never read from the environment. */
+  clientId: string;
+  /** The app's refresh token (the Token column). Required; never read from the environment. */
+  refreshToken: string;
   /**
    * Instance policy from the host. When given, the instance reads no policy
    * or audit variables from the environment (see InstancePolicy). A host
@@ -165,10 +199,84 @@ export const plandayToolCatalog: readonly GatewayToolCatalogEntry[] = deepFreeze
     ...toGatewayDefinition(tool),
     upstream: tool.upstream.map(operation => ({ ...operation })),
     broad: tool.broad === true,
+    requiresConfirmation: tool.requiresConfirmation === true,
+    ...(tool.change
+      ? { change: { ...tool.change, logFields: tool.change.logFields.map(field => ({ ...field })) } }
+      : {}),
   })),
 );
 
-function requiredCredential(options: PlandayGatewayOptions, name: 'apiKey' | 'baseUrl'): string {
+/** What a write tool call will change, resolved from its input before anything is sent. */
+export interface PlandayChange {
+  readonly tool: string;
+  readonly action: PlandayChangeAction;
+  readonly record: PlandayChangeRecord;
+  readonly movesMoney: false;
+  readonly requiresConfirmation: boolean;
+  /**
+   * The values of the tool's `logFields` that are present and have their
+   * field's type. A value of the wrong type is left out, so a name or a free
+   * text can never reach the values.
+   */
+  readonly values: Readonly<Record<string, string | number | boolean>>;
+}
+
+export type PlandayChangeResolution =
+  | { readonly ok: true; readonly change: PlandayChange }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Resolves what a write tool call will change, for a host that logs the
+ * change before the call runs: the action, the record kind and the values of
+ * the tool's `logFields`: Planday ids, dates and times in clear, never a
+ * name or a comment. A field of type `pseudonym` would come back only as
+ * HMAC-SHA-256 with `options.pseudonymKey` (else SHA-256). Refuses
+ * read tools, unknown tools and invalid input, as callTool does.
+ */
+export function resolvePlandayChange(
+  toolName: string,
+  input: GatewayJsonObject = {},
+  options: { pseudonymKey?: string | Uint8Array; redactor?: SecretRedactor } = {},
+): PlandayChangeResolution {
+  const name = typeof toolName === 'string' ? toolName.trim() : '';
+  const tool = name ? findTool(`${TOOL_PREFIX}${stripPrefix(name)}`) : undefined;
+  if (!tool) return { ok: false, reason: 'Unsupported Planday gateway tool.' };
+  if (!tool.change) return { ok: false, reason: `${stripPrefix(tool.name)} is not a write tool.` };
+  const valid = validateCall(tool, input);
+  if (!valid.ok) return { ok: false, reason: `Invalid input for ${stripPrefix(tool.name)}.` };
+  const data = valid.data;
+  const values: Record<string, string | number | boolean> = {};
+  for (const field of tool.change.logFields) {
+    const value = logFieldValue(field.type, data[field.name], options.pseudonymKey);
+    if (value === undefined) continue;
+    // A secret put in a field by mistake never reaches the host's log: with an instance's redactor, a value that
+    // holds a piece of its token is left out.
+    if (options.redactor && leaksSecret(String(value), options.redactor)) continue;
+    values[field.name] = value;
+  }
+  return {
+    ok: true,
+    change: Object.freeze({
+      tool: stripPrefix(tool.name),
+      action: tool.change.action,
+      record: tool.change.record,
+      movesMoney: false as const,
+      requiresConfirmation: tool.requiresConfirmation === true,
+      values: Object.freeze(values),
+    }),
+  };
+}
+
+function requiredClientId(options: PlandayGatewayOptions): string {
+  const value: unknown = (options as Partial<PlandayGatewayOptions> | undefined)?.clientId;
+  // The client id is not a secret, but it is sent in a header: printable ASCII only.
+  if (typeof value !== 'string' || !/^[!-~]{1,200}$/.test(value.trim())) {
+    throw new ConfigError('createPlandayGateway requires options.clientId. Embedded instances do not read credentials from the environment.');
+  }
+  return value.trim();
+}
+
+function requiredCredential(options: PlandayGatewayOptions, name: 'refreshToken'): string {
   const value: unknown = (options as Partial<PlandayGatewayOptions> | undefined)?.[name];
   if (typeof value !== 'string' || value.trim() === '') {
     throw new ConfigError(
@@ -177,57 +285,87 @@ function requiredCredential(options: PlandayGatewayOptions, name: 'apiKey' | 'ba
   }
   // Key admission (src/key-admission.ts): printable ASCII of 16 characters or more, sharing no piece with any text of
   // ours. Checked before anything is built from the key; the refusal is a fixed text that holds no piece of it.
-  if (name === 'apiKey' && !admitsKey(value.trim())) {
+  if (!admitsKey(value.trim())) {
     throw new ConfigError(keyRefusedText(value.trim()));
   }
   return value.trim();
 }
 
 /**
- * Create one gateway instance. `apiKey` and `baseUrl` are required and
- * are the only credentials the instance uses; a missing value fails here.
+ * Create one gateway instance for one Planday portal. `clientId` and
+ * `refreshToken` are required and are the only credentials the instance
+ * uses; a missing value fails here.
  */
 export function createPlandayGateway(options: PlandayGatewayOptions) {
-  let apiKey: string | undefined;
-  let guard: SecretRedactor | undefined;
-  // What the host gave, admitted or not: every error is masked against it.
-  const given: unknown = (options as Partial<PlandayGatewayOptions> | undefined)?.apiKey;
-  const secrets = typeof given === 'string' ? [given, given.trim()] : [];
+  let refreshToken: string | undefined;
+  // The host's pseudonym key, in every form it could be written, read before anything else can fail.
+  const pseudonymForms = keyForms((options as Partial<PlandayGatewayOptions> | undefined)?.policy?.pseudonymKey);
+  // Every secret is known to the guard before any validation that can throw.
+  const guard = new SecretRedactor();
+  for (const form of pseudonymForms) guard.addSecret(form);
+  // What the host gave, admitted or not: every error is masked against it, the pseudonym key included.
+  const given: unknown = (options as Partial<PlandayGatewayOptions> | undefined)?.refreshToken;
+  const secrets = [...(typeof given === 'string' ? [given, given.trim()] : []), ...pseudonymForms];
+  const refusal = () => keyRefusedText(refreshToken ?? '');
   try {
-    // Admission first, before a redactor is built from the key.
-    apiKey = requiredCredential(options, 'apiKey');
-    guard = new SecretRedactor().addSecret(apiKey);
-    // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of the key.
+    // The pseudonym key is admitted like the refresh token: as text, printable and sharing no piece with any text
+    // of ours, so no fixed text (a fallback, an error, the tool list) can carry a piece of it; as bytes, every
+    // form of it that is printable text (the bytes read as text, hex, base64) the same way.
+    const pseudonymKey: unknown = (options as Partial<PlandayGatewayOptions> | undefined)?.policy?.pseudonymKey;
+    const refused =
+      typeof pseudonymKey === 'string'
+        ? !admitsKey(pseudonymKey)
+        : pseudonymForms.some(form => /^[ -~]+$/.test(form) && !admitsKey(form));
+    if (refused) throw new ConfigError(PSEUDONYM_KEY_REFUSED);
+    // Admission of the refresh token, before a redactor is built from it.
+    refreshToken = requiredCredential(options, 'refreshToken');
+    guard.addSecret(refreshToken);
+    const clientId = requiredClientId(options);
+    // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of a key.
     if (leaksSecret(fixedOutputs(), guard)) {
-      throw new ConfigError(keyRefusedText(apiKey));
+      throw new ConfigError(refusal());
     }
-    const gateway = buildGateway(options, apiKey);
+    const gateway = buildGateway(options, clientId, refreshToken);
     // The tool list leaves the gateway as it is: a key that shares a piece with it is refused.
     if (leaksSecret(gateway.tools, guard)) {
-      throw new ConfigError(keyRefusedText(apiKey));
+      throw new ConfigError(refusal());
     }
     return gateway;
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error);
-    let message = raw;
-    if (guard && apiKey !== undefined) {
-      // Redacted, then checked whole as the very last step: a message that still holds a piece of the key becomes
-      // the fixed refusal.
-      message = guard.redact(raw);
-      if (leaksSecret(message, guard)) message = keyRefusedText(apiKey);
-    }
+    // Redacted, then checked whole as the very last step: a message that still holds a piece of a key becomes the
+    // fixed refusal.
+    let message = guard.redact(raw);
+    if (leaksSecret(message, guard)) message = refusal();
     // A fresh error in final form (src/key-admission.ts, sealedError): no cause, a stack without frames, and name,
-    // message and stack masked against the key. Then the sink check on the finished object.
+    // message and stack masked against every key. Then the sink check on the finished object.
     const final = sealedError(error instanceof ConfigError ? new ConfigError(message) : new Error(message), ...secrets);
-    if (guard && apiKey !== undefined && leaksSecret(final, guard)) {
-      throw sealedError(new ConfigError(keyRefusedText(apiKey)), ...secrets);
+    if (leaksSecret(final, guard)) {
+      throw sealedError(new ConfigError(refusal()), ...secrets);
     }
     throw final;
   }
 }
 
-function buildGateway(options: PlandayGatewayOptions, apiKey: string) {
-  const baseUrl = requiredCredential(options, 'baseUrl');
+const PSEUDONYM_KEY_REFUSED =
+  'policy.pseudonymKey was refused: use at least 32 random printable characters (for example 32 random bytes as hex) or at least 32 random bytes.';
+
+/** A key given as text or bytes, in every form it could be written: as given, or as the bytes read or encoded. */
+function keyForms(key: unknown): string[] {
+  if (typeof key === 'string') return key === '' ? [] : [...new Set([key, key.trim()])];
+  if (key instanceof Uint8Array) {
+    const bytes = Buffer.from(key);
+    return [...new Set(['utf8', 'latin1', 'hex', 'base64', 'base64url'].map(form => bytes.toString(form as BufferEncoding)))];
+  }
+  return [];
+}
+
+/** Register a key given as text or bytes, in every form it could be written. */
+function addKeyMaterial(redactor: SecretRedactor, key: string | Uint8Array): void {
+  for (const form of keyForms(key)) redactor.addSecret(form);
+}
+
+function buildGateway(options: PlandayGatewayOptions, clientId: string, refreshToken: string) {
   const { policy: hostPolicy, ...clientOptions } = options;
   const policy =
     hostPolicy === undefined ? undefined : resolveInstancePolicy(hostPolicy, PLANDAY_TOOLS.map(tool => tool.name));
@@ -238,18 +376,27 @@ function buildGateway(options: PlandayGatewayOptions, apiKey: string) {
   }
   const client = new PlandayClient({
     ...clientOptions,
-    apiKey,
-    baseUrl,
+    clientId,
+    refreshToken,
     credentialEnv: {},
     // Under a host's policy nothing is read from the environment, this switch included.
     ...(policy ? { allowCustomBaseUrl: clientOptions.allowCustomBaseUrl ?? false } : {}),
   });
   const redactor: SecretRedactor = client.redactor;
+  // The host's pseudonym key is a secret like the refresh token: kept out of results, logs and errors.
+  if (policy?.pseudonymKey !== undefined) addKeyMaterial(redactor, policy.pseudonymKey);
   // Every call in a scope of its own, with or without a host policy: a call made from inside another
   // instance's call (its audit sink or its fetch) never runs under that instance's policy, sink or redactor.
   const underPolicy = <T>(work: () => T): T => runInCallScope(policy ? { policy, redactor } : { redactor }, work);
 
   return {
+    /**
+     * resolvePlandayChange bound to this instance: a value that holds a piece of
+     * this instance's token is left out of the values.
+     */
+    resolveChange(toolName: string, input: GatewayJsonObject = {}, resolveOptions: { pseudonymKey?: string | Uint8Array } = {}) {
+      return resolvePlandayChange(toolName, input, { ...resolveOptions, redactor });
+    },
     /** Tools enabled on this instance (the policy's or PLANDAY_DISABLED_TOOLS' disabled tools are left out). */
     tools: underPolicy(() => plandayGatewayTools.filter(tool => !isToolDisabled(tool.name))),
     callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
@@ -282,15 +429,14 @@ function buildGateway(options: PlandayGatewayOptions, apiKey: string) {
       const tool = name ? findTool(`${TOOL_PREFIX}${stripPrefix(name)}`) : undefined;
       if (!tool) {
         // Redacted before it is cut short: a cut key would no longer match the redactor.
-        const reason = `Unsupported Planday gateway tool: ${redactor.redact(String(toolName)).slice(0, 100)}`;
-        await auditRejectedCall(String(toolName), input, reason, context);
-        return errorResult(redactor.redact(reason));
+        await auditRejectedCall(String(toolName), input, 'unknown_tool', context);
+        return errorResult('Unsupported Planday gateway tool.');
       }
 
       const parsed = tool.inputSchema.safeParse(input ?? {});
       if (!parsed.success) {
         const reason = `Invalid input for ${name}: ${z.prettifyError(parsed.error)}`;
-        await auditRejectedCall(tool.name, input, 'invalid input', context);
+        await auditRejectedCall(tool.name, input, 'invalid_input', context);
         return errorResult(redactor.redact(reason));
       }
 

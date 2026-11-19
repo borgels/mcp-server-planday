@@ -5,9 +5,9 @@ import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { API_KEY_HEADER, PlandayClient } from '../src/planday/client.js';
-import { createPlandayGateway, plandayGatewayTools, plandayToolCatalog } from '../src/gateway.js';
-import { PLANDAY_TOOLS } from '../src/tools/planday.js';
-import { BASE, auditLines, connect, stubFetch, texts } from './helpers.js';
+import { createPlandayGateway, plandayGatewayTools, plandayToolCatalog, type GatewayJsonObject } from '../src/gateway.js';
+import { PLANDAY_TOOLS, pseudonym } from '../src/tools/planday.js';
+import { accessTokenFor, BASE, CLIENT_ID, TOKEN_URL, auditLines, connect, stubFetch, texts, testGateway, testClient, withToken, SHIFT_CREATED } from './helpers.js';
 
 const originalEnv = { ...process.env };
 let dir: string;
@@ -29,9 +29,9 @@ afterEach(() => {
 /** Placeholder credentials, built at runtime: long enough to be redacted by value. */
 const fakeKey = (label: string) => `${label}-${'x'.repeat(12)}`;
 // Keys with no piece of six characters in common: the redactor also removes any such piece of its own key.
-const KEY_A = 'alpha-0123456789-kq';
+const KEY_A = 'omega-0123456789-kq'; // gitleaks:allow (a test value, not a key)
 const KEY_B = 'bravo-zyxwvutsrq-MP';
-const ENV_KEY = 'envkey-ABCDEFGHIJ-77';
+const ENV_KEY = 'envkey-ABCDEFGHIJ-77'; // gitleaks:allow (a test value, not a key)
 
 /** Upstream that answers every request with an error body echoing `echo`. */
 function echoingFetch(echo: string) {
@@ -46,19 +46,20 @@ function headersOf(init?: RequestInit): Record<string, string> {
 }
 
 describe('explicit gateway credentials', () => {
-  it('requires apiKey and baseUrl and ignores the environment', () => {
-    process.env.PLANDAY_API_KEY = ENV_KEY;
-    process.env.PLANDAY_BASE_URL = BASE;
+  it('requires the client id and the refresh token, and ignores the environment', () => {
+    process.env.PLANDAY_CLIENT_ID = CLIENT_ID;
+    process.env.PLANDAY_REFRESH_TOKEN = ENV_KEY;
 
-    expect(() => createPlandayGateway({ baseUrl: BASE } as never)).toThrow(/requires options\.apiKey/);
-    expect(() => createPlandayGateway({ apiKey: KEY_A } as never)).toThrow(/requires options\.baseUrl/);
-    expect(() => createPlandayGateway({ apiKey: '  ', baseUrl: BASE })).toThrow(/requires options\.apiKey/);
-    expect(() => createPlandayGateway(undefined as never)).toThrow(/requires options\.apiKey/);
+    expect(() => createPlandayGateway({ clientId: CLIENT_ID } as never)).toThrow(/requires options\.refreshToken/);
+    expect(() => createPlandayGateway({ clientId: CLIENT_ID, refreshToken: '  ' })).toThrow(/requires options\.refreshToken/);
+    expect(() => createPlandayGateway({ refreshToken: KEY_A } as never)).toThrow(/requires options\.clientId/);
+    expect(() => createPlandayGateway({ clientId: 'with space', refreshToken: KEY_A })).toThrow(/requires options\.clientId/);
+    expect(() => createPlandayGateway(undefined as never)).toThrow(/requires options\.refreshToken/);
   });
 
   it('never reads credential variables from process.env, even when they are set', async () => {
     const reads = new Set<string>();
-    const env = { ...process.env, PLANDAY_API_KEY: ENV_KEY, PLANDAY_BASE_URL: BASE };
+    const env = { ...process.env, PLANDAY_CLIENT_ID: 'env-client', PLANDAY_REFRESH_TOKEN: ENV_KEY, PLANDAY_BASE_URL: BASE };
     process.env = new Proxy(env, {
       get(target, property, receiver) {
         if (typeof property === 'string') {
@@ -68,42 +69,49 @@ describe('explicit gateway credentials', () => {
       },
     });
 
-    expect(() => createPlandayGateway({ baseUrl: BASE } as never)).toThrow(/requires options\.apiKey/);
+    expect(() => createPlandayGateway({ clientId: CLIENT_ID } as never)).toThrow(/requires options\.refreshToken/);
 
-    const fetchImpl = stubFetch({ [`GET ${BASE}/items/i1`]: { body: { id: 'i1' } } });
-    const gw = createPlandayGateway({ apiKey: KEY_A, baseUrl: BASE, fetchImpl: fetchImpl as unknown as typeof fetch });
-    const result = await gw.callTool('get_item', { itemId: 'i1' });
+    const fetchImpl = stubFetch({ [`GET ${BASE}/hr/v1.0/employees/12`]: { body: { data: { id: 12 } } } });
+    const gw = createPlandayGateway({ clientId: CLIENT_ID, refreshToken: KEY_A, fetchImpl: withToken(fetchImpl) });
+    const result = await gw.callTool('get_employee', { employeeId: 12 });
     expect(result.isError).toBeUndefined();
-    expect(headersOf(fetchImpl.mock.calls[0]?.[1])[API_KEY_HEADER]).toBe(KEY_A);
+    expect(headersOf(fetchImpl.mock.calls[0]?.[1])[API_KEY_HEADER]).toBe(`Bearer ${accessTokenFor(KEY_A)}`);
+    expect(headersOf(fetchImpl.mock.calls[0]?.[1])['X-ClientId']).toBe(CLIENT_ID);
 
-    expect(reads.has('PLANDAY_API_KEY')).toBe(false);
-    expect(reads.has('PLANDAY_BASE_URL')).toBe(false);
+    for (const name of ['PLANDAY_CLIENT_ID', 'PLANDAY_REFRESH_TOKEN', 'PLANDAY_BASE_URL', 'PLANDAY_TOKEN_URL']) expect(reads.has(name), name).toBe(false);
   });
 
   it('still reads credentials from the environment in the standalone client', async () => {
-    process.env.PLANDAY_API_KEY = ENV_KEY;
-    process.env.PLANDAY_BASE_URL = BASE;
-    const fetchImpl = vi.fn(async () => Response.json({})) as unknown as typeof fetch & ReturnType<typeof vi.fn>;
-    await new PlandayClient({ fetchImpl }).get('/items/1');
-    expect(headersOf(fetchImpl.mock.calls[0]?.[1] as RequestInit)[API_KEY_HEADER]).toBe(ENV_KEY);
+    process.env.PLANDAY_CLIENT_ID = 'env-client';
+    process.env.PLANDAY_REFRESH_TOKEN = ENV_KEY;
+    const token = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      expect(String(init?.body)).toBe(`client_id=env-client&grant_type=refresh_token&refresh_token=${ENV_KEY}`);
+      return Response.json({ access_token: accessTokenFor(ENV_KEY), expires_in: 3600 });
+    });
+    const api = vi.fn(async () => Response.json({}));
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) =>
+      String(input) === TOKEN_URL ? token(input, init) : api()) as typeof fetch;
+    await new PlandayClient({ fetchImpl }).get('/hr/v1.0/employees/1');
+    expect(token).toHaveBeenCalledTimes(1);
+    expect(api).toHaveBeenCalledTimes(1);
   });
 });
 
 describe('per-instance redaction', () => {
   it('redacts each instance’s own key in its tool results', async () => {
-    const a = createPlandayGateway({ apiKey: KEY_A, baseUrl: BASE, fetchImpl: echoingFetch(KEY_A) });
-    const b = createPlandayGateway({ apiKey: KEY_B, baseUrl: BASE, fetchImpl: echoingFetch(KEY_B) });
+    const a = testGateway({ accessToken: KEY_A, baseUrl: BASE, fetchImpl: echoingFetch(KEY_A) });
+    const b = testGateway({ accessToken: KEY_B, baseUrl: BASE, fetchImpl: echoingFetch(KEY_B) });
 
-    const resultA = texts(await a.callTool('get_item', { itemId: 'i1' })).join(' ');
-    const resultB = texts(await b.callTool('get_item', { itemId: 'i1' })).join(' ');
+    const resultA = texts(await a.callTool('get_employee', { employeeId: 12 })).join(' ');
+    const resultB = texts(await b.callTool('get_employee', { employeeId: 12 })).join(' ');
     // The echoing error body is never read into the result; the key is not there in any form.
     expect(resultA).not.toContain(KEY_A);
     expect(resultB).not.toContain(KEY_B);
   });
 
   it('keeps redactors separate: an instance holds only its own secrets', () => {
-    const a = new PlandayClient({ apiKey: KEY_A, baseUrl: BASE, credentialEnv: {} });
-    const b = new PlandayClient({ apiKey: KEY_B, baseUrl: BASE, credentialEnv: {} });
+    const a = testClient({ accessToken: KEY_A, baseUrl: BASE, credentialEnv: {} });
+    const b = testClient({ accessToken: KEY_B, baseUrl: BASE, credentialEnv: {} });
     expect(a.redactor.hasSecret(KEY_A)).toBe(true);
     expect(a.redactor.hasSecret(KEY_B)).toBe(false);
     expect(b.redactor.hasSecret(KEY_B)).toBe(true);
@@ -114,9 +122,9 @@ describe('per-instance redaction', () => {
 
   it('does not accumulate keys of earlier instances', () => {
     for (let index = 0; index < 200; index += 1) {
-      createPlandayGateway({ apiKey: `short-lived-key-${index}`, baseUrl: BASE });
+      testGateway({ accessToken: `short-lived-key-${index}`, baseUrl: BASE });
     }
-    const fresh = new PlandayClient({ apiKey: KEY_A, baseUrl: BASE, credentialEnv: {} });
+    const fresh = testClient({ accessToken: KEY_A, baseUrl: BASE, credentialEnv: {} });
     expect(fresh.redactor.redact('short-lived-key-7')).toBe('short-lived-key-7');
   });
 
@@ -126,27 +134,27 @@ describe('per-instance redaction', () => {
       vi.fn(async () => {
         throw new TypeError(`connection refused while sending ${key}`);
       }) as unknown as typeof fetch;
-    const a = createPlandayGateway({ apiKey: KEY_A, baseUrl: BASE, fetchImpl: failing(KEY_A), maxAttempts: 1 });
-    const b = createPlandayGateway({ apiKey: KEY_B, baseUrl: BASE, fetchImpl: failing(KEY_B), maxAttempts: 1 });
-    await a.callTool('get_item', { itemId: 'i1' }, { requestId: 'a' });
-    await b.callTool('get_item', { itemId: 'i1' }, { requestId: 'b' });
+    const a = testGateway({ accessToken: KEY_A, baseUrl: BASE, fetchImpl: failing(KEY_A), maxAttempts: 1 });
+    const b = testGateway({ accessToken: KEY_B, baseUrl: BASE, fetchImpl: failing(KEY_B), maxAttempts: 1 });
+    await a.callTool('get_employee', { employeeId: 12 }, { requestId: 'a' });
+    await b.callTool('get_employee', { employeeId: 12 }, { requestId: 'b' });
 
     const errors = auditLines(process.env.PLANDAY_AUDIT_LOG).filter(line => line.action === 'error');
-    expect(errors.map(line => line.requestId)).toEqual(['a', 'b']);
+    expect(errors.map(line => line.requestId)).toEqual([pseudonym('a'), pseudonym('b')]);
     const log = JSON.stringify(errors);
     expect(log).not.toContain(KEY_A);
     expect(log).not.toContain(KEY_B);
   });
 
   it('redacts with the server client’s key on the MCP path', async () => {
-    const tool = PLANDAY_TOOLS.find(t => t.name === 'planday_get_item')!;
+    const tool = PLANDAY_TOOLS.find(t => t.name === 'planday_get_employee')!;
     const original = tool.handler;
     tool.handler = async () => {
       throw new Error('failed with test-api-key');
     };
     try {
       const { mcpClient } = await connect();
-      const result = await mcpClient.callTool({ name: 'planday_get_item', arguments: { itemId: 'i1' } });
+      const result = await mcpClient.callTool({ name: 'planday_get_employee', arguments: { employeeId: 12 } });
       expect(texts(result).join(' ')).not.toContain('test-api-key');
     } finally {
       tool.handler = original;
@@ -156,8 +164,8 @@ describe('per-instance redaction', () => {
   it('lets a dropped instance and its key be garbage collected', async () => {
     setFlagsFromString('--expose-gc');
     const gc = runInNewContext('gc') as () => void;
-    let gateway: ReturnType<typeof createPlandayGateway> | undefined = createPlandayGateway({
-      apiKey: fakeKey('collectable'),
+    let gateway: ReturnType<typeof createPlandayGateway> | undefined = testGateway({
+      accessToken: fakeKey('collectable'),
       baseUrl: BASE,
     });
     const ref = new WeakRef(gateway);
@@ -171,16 +179,45 @@ describe('per-instance redaction', () => {
 });
 
 /** Sample input per tool, used to check each tool's declared upstream requests. */
-const SAMPLE_INPUTS: Record<string, Record<string, string>> = {
-  get_item: { itemId: 'i1' },
-  create_item: { name: 'New item' },
+const SAMPLE_INPUTS: Record<string, GatewayJsonObject> = {
+  check_connection: {},
+  list_departments: {},
+  list_employee_groups: { limit: 10 },
+  list_employees: { search: 'Hansen' },
+  get_employee: { employeeId: 21 },
+  list_shifts: { from: '2026-11-01', to: '2026-11-30', departmentId: 1 },
+  get_shift: { shiftId: 31 },
+  list_shift_types: { activeOnly: true },
+  list_positions: {},
+  list_shift_requests: { departmentIds: [1, 2] },
+  list_punch_clock_records: { from: '2026-11-01', to: '2026-11-07' },
+  create_shift: { departmentId: 1, employeeGroupId: 2, date: '2026-11-20', startTime: '08:00', endTime: '16:00' },
+  assign_shift: { shiftId: 31, employeeId: 21 },
+  approve_shift_request: { shiftId: 31, employeeId: 21 },
 };
+
+/** Answers that let every tool run to its end: the record asked for, a list of one, a shift with employee 21. */
+async function catalogFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  const path = new URL(String(input)).pathname;
+  const method = init?.method ?? 'GET';
+  if (method === 'POST' && path.endsWith('/shifts')) return Response.json({ data: SHIFT_CREATED });
+  if (method === 'POST') return new Response(null, { status: 204 });
+  const shiftId = /\/shifts\/(\d+)$/.exec(path)?.[1];
+  if (shiftId) return Response.json({ data: { id: Number(shiftId), employeeId: 21 } });
+  if (path.endsWith('/shifts/requests')) return Response.json({ data: [{ shiftId: 31, requesters: [{ employeeId: 21 }] }] });
+  const employeeId = /\/employees\/(\d+)$/.exec(path)?.[1];
+  if (employeeId) return Response.json({ data: { id: Number(employeeId) } });
+  return Response.json({ data: [{ id: 1, departmentId: 1 }], paging: { offset: 0, limit: 50, total: 1 } });
+}
 
 describe('tool catalog', () => {
   it('lists every registered tool, matching the gateway definitions', async () => {
     expect(plandayToolCatalog.map(entry => entry.name)).toEqual(plandayGatewayTools.map(tool => tool.name));
     for (const entry of plandayToolCatalog) {
-      const { upstream, broad, ...definition } = entry;
+      const { upstream, broad, requiresConfirmation, change, ...definition } = entry;
+      expect(typeof requiresConfirmation).toBe('boolean');
+      expect(change === undefined).toBe(entry.riskLevel === 'read');
+      if (requiresConfirmation) expect(entry.riskLevel).toBe('write');
       expect(typeof broad).toBe('boolean');
       if (broad) expect(entry.riskLevel).toBe('read');
       expect(definition).toEqual(plandayGatewayTools.find(tool => tool.name === entry.name));
@@ -227,18 +264,18 @@ describe('tool catalog', () => {
     for (const entry of plandayToolCatalog) {
       const input = SAMPLE_INPUTS[entry.name];
       expect(input, `sample input for ${entry.name}`).toBeDefined();
-      const fetchImpl = vi.fn(async () => Response.json({ ok: true }));
-      const gw = createPlandayGateway({ apiKey: KEY_A, baseUrl: BASE, fetchImpl: fetchImpl as unknown as typeof fetch });
+      const fetchImpl = vi.fn(catalogFetch);
+      const gw = testGateway({ accessToken: KEY_A, fetchImpl });
       const result = await gw.callTool(entry.name, input!);
       expect(result.isError, texts(result).join(' ')).toBeUndefined();
 
       const declared = entry.upstream.map(op => ({
         method: op.method,
-        path: op.path.replace(/\{(\w+)\}/g, (_, name: string) => encodeURIComponent(input![name] ?? '')),
+        path: op.path.replace(/\{(\w+)\}/g, (_, name: string) => encodeURIComponent(String(input![name] ?? ''))),
       }));
       const made = (fetchImpl.mock.calls as unknown as Array<[string, RequestInit]>).map(([url, init]) => ({
         method: init.method,
-        path: new URL(url).pathname.slice(new URL(BASE).pathname.length),
+        path: new URL(url).pathname,
       }));
       for (const request of made) {
         expect(declared, `${entry.name} made ${request.method} ${request.path}`).toContainEqual(request);

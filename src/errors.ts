@@ -51,7 +51,7 @@ const BASE_PATTERNS: readonly RegExp[] = [
   headerPattern('x-api-key'),
   // Any scheme word (Bearer, Basic, Token, ...) followed by the credentials.
   /["']?authorization["']?\s*[:=]\s*["']?(?:[a-z][\w-]*\s+)?[^"',\s}]+/gi,
-  /(apiKey|PLANDAY_API_KEY|api_key|access_token)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
+  /(refreshToken|refresh_token|PLANDAY_REFRESH_TOKEN|access_token|api_key)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
 ];
 
 /**
@@ -63,6 +63,7 @@ const BASE_PATTERNS: readonly RegExp[] = [
  * key is released with its instance. There is no process-wide registry.
  */
 export class SecretRedactor {
+  private readonly values = new Set<string>();
   private readonly secrets = new Set<string>();
   private readonly fragments = new Set<string>();
   private readonly patterns: RegExp[] = [...BASE_PATTERNS];
@@ -72,12 +73,28 @@ export class SecretRedactor {
     if (!value || value.length < MIN_SECRET_LENGTH) {
       return this;
     }
+    this.values.add(value);
     for (const form of new Set([value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1)])) {
       this.secrets.add(form);
       for (let i = 0; i + FRAGMENT_LENGTH <= form.length; i += 1) {
         this.fragments.add(form.slice(i, i + FRAGMENT_LENGTH));
       }
     }
+    return this;
+  }
+
+  /**
+   * Stop redacting a value that is no longer a secret of this instance (an
+   * access token that was replaced). The other secrets, and their pieces,
+   * stay.
+   */
+  removeSecret(value: string): this {
+    if (!this.values.delete(value)) return this;
+    const remaining = [...this.values];
+    this.values.clear();
+    this.secrets.clear();
+    this.fragments.clear();
+    for (const secret of remaining) this.addSecret(secret);
     return this;
   }
 
@@ -157,13 +174,15 @@ function applyPatterns(value: string, patterns: readonly RegExp[]): string {
   );
 }
 
-/** Our own guidance per HTTP status. Replace or extend with the vendor's documented statuses. */
+/** Our own guidance per HTTP status. Nothing of the response body (Planday's problem details) is used. */
 const STATUS_HINTS: Record<number, string> = {
-  401: 'The API key was rejected (invalid or expired). The server operator must renew PLANDAY_API_KEY.',
-  403: 'The API key has no access to this resource. Retrying will not help.',
-  404: 'The object was not found, or the API key has no access to it. Check the ids.',
-  429: 'The upstream API is throttling requests. Wait and retry later.',
-};
+  400: 'Planday refused the input (a field missing, or a value Planday does not accept). Check the ids, dates and times.',
+  401: "Planday did not accept the app's access, also after a new access token. An administrator checks the app under Settings > Integrations > API Access.",
+  403: 'The app has no access to this (a scope not given to the app, or no permission in that department). Retrying will not help.',
+  404: 'The object was not found, or the app has no access to it. Check the ids.',
+  409: 'Planday refused the change: it would conflict with another shift or break a labour rule. Nothing was changed.',
+  429: 'Planday is throttling requests. Wait and retry later.',
+}
 
 /**
  * An HTTP error from the upstream API. It keeps the status and the parsed

@@ -1,4 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { createHmac, createHash } from 'node:crypto';
 import { z } from 'zod/v4';
 import {
   READ_TOOL_ANNOTATIONS,
@@ -8,30 +9,92 @@ import {
 } from '../planday/annotations.js';
 import { assertAuditLogWritable, auditTarget, newRequestId, writeAuditEvent } from '../planday/audit.js';
 import { readOnlyClient, type UpstreamClient } from '../planday/client.js';
-import { formatUnknownError, type SecretRedactor } from '../errors.js';
-import { createItem, getItem } from '../planday/items.js';
-import { checkInputPolicy, checkToolPolicy, isToolDisabled, redactInScope, runInCallScope, validatePolicyConfig } from '../planday/policy.js';
-
-const MAX_ID_LENGTH = 200;
-const idSchema = z.string().trim().min(1).max(MAX_ID_LENGTH);
+import { formatUnknownError, redactDeep, type SecretRedactor } from '../errors.js';
+import { withheldResult } from '../fallbacks.js';
+import { leaksSecret } from '../key-admission.js';
+import {
+  approveShiftRequest,
+  assignShift,
+  checkConnection,
+  createShift,
+  getEmployee,
+  getShift,
+  listDepartments,
+  listEmployeeGroups,
+  listEmployees,
+  listPositions,
+  listPunchClockRecords,
+  listShiftRequests,
+  listShifts,
+  listShiftTypes,
+  SHIFT_STATUSES,
+} from '../planday/resources.js';
+import {
+  checkInputPolicy,
+  checkToolPolicy,
+  currentInstancePolicy,
+  isToolDisabled,
+  redactInScope,
+  runInCallScope,
+  validatePolicyConfig,
+} from '../planday/policy.js';
+import { daysBetween, isIsoDate, isRecordId, isTime, TIME_PATTERN } from '../planday/values.js';
 
 type ToolAnnotations = typeof READ_TOOL_ANNOTATIONS | typeof WRITE_TOOL_ANNOTATIONS;
 
 /**
  * One upstream request a tool may make: `read` or `write`, the HTTP method
- * and the path template relative to the base URL (`{name}` marks a
+ * and the path template relative to the API base (`{name}` marks a
  * caller-supplied segment). Published in the gateway tool catalog so a host
  * can see what each tool touches; keep it in step with the handler.
  */
 export interface UpstreamOperation {
   access: 'read' | 'write';
-  method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
+  method: 'GET' | 'POST' | 'PUT';
   path: string;
 }
 
 /** A client that carries the redactor of its instance (PlandayClient does). */
 export interface RedactingClient extends UpstreamClient {
   readonly redactor: SecretRedactor;
+}
+
+/** What a write tool does. */
+export type PlandayChangeAction = 'create' | 'assign' | 'approve_request';
+
+/** The kind of record a write tool touches. */
+export type PlandayChangeRecord = 'shift';
+
+/**
+ * The type a logged value must have; anything else is left out of the values.
+ *   recordId  a Planday id (a positive integer), in clear
+ *   date      a date YYYY-MM-DD, in clear
+ *   time      a time HH:MM, in clear
+ *   count     the number of entries in a list, never the entries
+ *   flag      true or false, in clear
+ *   kind      one value from a fixed list the tool's schema allows, in clear
+ *   pseudonym a value a person chose; never logged in clear: "sha256:" and
+ *             16 hex characters, or "hmac:" with a key from the host.
+ * Names, e-mail addresses, comments and other free text are never log fields.
+ */
+export type PlandayLogFieldType = 'recordId' | 'date' | 'time' | 'count' | 'flag' | 'kind' | 'pseudonym';
+
+export interface PlandayLogField {
+  readonly name: string;
+  readonly type: PlandayLogFieldType;
+}
+
+/**
+ * Write tools only: what the change does, for a host that logs a change
+ * before it is sent. `logFields` are the input fields that identify it, each
+ * with the one type its value must have.
+ */
+export interface PlandayChangeSpec {
+  readonly action: PlandayChangeAction;
+  readonly record: PlandayChangeRecord;
+  /** Always false: no tool moves money or touches wages. */
+  readonly movesMoney: false;
+  readonly logFields: readonly PlandayLogField[];
 }
 
 /**
@@ -53,13 +116,14 @@ export interface ToolDefinition<S extends z.ZodRawShape = z.ZodRawShape> {
   summary: string;
   /** Every upstream request the handler may make. */
   upstream: readonly UpstreamOperation[];
-  /**
-   * True when the tool can read more than its name says: anything in the
-   * system, chosen by the input (a generic get-by-path, a raw query).
-   * Published as `broad` in the gateway catalog, so a host that grants tools
-   * per role gives it only to roles that may read everything. Default false.
-   */
+  /** True when the tool can read more than its name says. None of these tools does. */
   broad?: boolean;
+  /** Write tools: what the change does. */
+  change?: PlandayChangeSpec;
+  /** True when a person should confirm each call outside the chat. No tool here moves money, so none is. */
+  requiresConfirmation?: boolean;
+  /** Cross-field checks the schema shape cannot express. Returns a refusal or undefined. */
+  check?: (input: Record<string, unknown>) => string | undefined;
   /**
    * Read-only tools (readOnlyHint) receive a client view that refuses
    * non-GET requests, so a mis-annotated tool cannot write.
@@ -78,43 +142,324 @@ function defineTool<S extends z.ZodRawShape>(definition: Omit<ToolDefinition<S>,
   } as unknown as ToolDefinition;
 }
 
+const change = (
+  action: PlandayChangeAction,
+  record: PlandayChangeRecord,
+  logFields: Record<string, PlandayLogFieldType>,
+): PlandayChangeSpec => ({
+  action,
+  record,
+  movesMoney: false,
+  logFields: Object.entries(logFields).map(([name, type]) => ({ name, type })),
+});
+
+// ---------------------------------------------------------------------------
+// Schemas
+
+const recordId = (what: string) => z.number().int().positive().max(Number.MAX_SAFE_INTEGER).describe(what);
+const dateSchema = z.string().trim().refine(isIsoDate, 'must be a date written YYYY-MM-DD');
+const timeSchema = z.string().trim().regex(TIME_PATTERN, 'must be a time written HH:MM');
+const pageShape = (max: number) => ({
+  offset: z.number().int().min(0).max(1_000_000).optional().describe('Skip this many records (default 0).'),
+  limit: z.number().int().min(1).max(max).optional().describe(`Records per page (default 50, at most ${max}).`),
+});
+/** At most this many days per shift or punch clock query. */
+const MAX_PERIOD_DAYS = 62;
+
+function period(input: Record<string, unknown>): string | undefined {
+  const from = String(input.from);
+  const to = String(input.to);
+  const days = daysBetween(from, to);
+  if (days < 0) return 'to is before from.';
+  return days > MAX_PERIOD_DAYS ? `Ask for at most ${MAX_PERIOD_DAYS} days at a time.` : undefined;
+}
+
+const WRITE_NOTE = 'Off unless writes are enabled (PLANDAY_ENABLE_WRITES, or the gateway host policy enableWrites).';
+
 export const PLANDAY_TOOLS: ToolDefinition[] = [
   defineTool({
-    name: 'planday_get_item',
-    title: 'Get Item (Planday)',
-    description: 'Fetch one item by id, optionally with its history.',
+    name: 'planday_check_connection',
+    title: 'Check Planday connection',
+    description: "Check that the app's token works, by reading one department. Returns only whether it works and the number of departments.",
+    inputShape: {},
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Checked the connection.',
+    upstream: [{ access: 'read', method: 'GET', path: '/hr/v1.0/departments' }],
+    handler: async client => checkConnection(client),
+  }),
+  defineTool({
+    name: 'planday_list_departments',
+    title: 'List departments (Planday)',
+    description: 'Departments of the portal: id, name and number.',
+    inputShape: pageShape(50),
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed departments.',
+    upstream: [{ access: 'read', method: 'GET', path: '/hr/v1.0/departments' }],
+    handler: async (client, input) => listDepartments(client, input),
+  }),
+  defineTool({
+    name: 'planday_list_employee_groups',
+    title: 'List employee groups (Planday)',
+    description: 'Employee groups (e.g. kitchen, bar): id and name.',
+    inputShape: pageShape(50),
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed employee groups.',
+    upstream: [{ access: 'read', method: 'GET', path: '/hr/v1.0/employeegroups' }],
+    handler: async (client, input) => listEmployeeGroups(client, input),
+  }),
+  defineTool({
+    name: 'planday_list_employees',
+    title: 'List employees (Planday)',
+    description:
+      'Active employees, a page at a time: name, job title, work e-mail and mobile, departments, employee groups, skills and hire date. CPR number, bank account, birth date, salary identifier, home address and wages are never read.',
     inputShape: {
-      itemId: idSchema.describe('Item id.'),
-      includeHistory: z.boolean().optional().describe('Also read the item history. A failed history read is reported in the result.'),
+      search: z
+        .string()
+        .trim()
+        .min(2)
+        .max(100)
+        .regex(/^[^\d]+$/, 'search by name or e-mail, without digits')
+        .optional()
+        .describe('A name or an e-mail address to search for. No digits: Planday also searches CPR numbers and salary identifiers.'),
+      ...pageShape(50),
     },
     annotations: READ_TOOL_ANNOTATIONS,
     returnsUpstreamContent: true,
-    summary: 'Fetched item.',
-    upstream: [
-      { access: 'read', method: 'GET', path: '/items/{itemId}' },
-      { access: 'read', method: 'GET', path: '/items/{itemId}/history' },
-    ],
-    handler: async (client, input) => getItem(client, input),
+    summary: 'Listed employees.',
+    upstream: [{ access: 'read', method: 'GET', path: '/hr/v1.0/employees' }],
+    handler: async (client, input) => listEmployees(client, input),
   }),
   defineTool({
-    name: 'planday_create_item',
-    title: 'Create Item (Planday)',
+    name: 'planday_get_employee',
+    title: 'Get employee (Planday)',
     description:
-      'Create a new item. Requires write access on this instance; confirm with the user before creating.',
+      'One employee: name, job title, work e-mail and mobile, departments, groups, skills, supervisor, hire and end date. CPR number, bank account, birth date, salary identifier, home address, gender and wages are never read.',
+    inputShape: { employeeId: recordId('The employee id.') },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Fetched employee.',
+    upstream: [{ access: 'read', method: 'GET', path: '/hr/v1.0/employees/{employeeId}' }],
+    handler: async (client, input) => getEmployee(client, input),
+  }),
+  defineTool({
+    name: 'planday_list_shifts',
+    title: 'List shifts (Planday)',
+    description:
+      'Shifts between two dates (inclusive, at most 62 days): date, start and end, department, employee, employee group, position, shift type, status, breaks and the comment. No wages.',
     inputShape: {
-      name: z.string().trim().min(1).max(200).describe('Item name.'),
-      description: z.string().trim().max(2000).optional().describe('Optional description.'),
+      from: dateSchema.describe('First date, YYYY-MM-DD.'),
+      to: dateSchema.describe('Last date, YYYY-MM-DD.'),
+      departmentId: recordId('Only this department.').optional(),
+      employeeId: recordId('Only this employee.').optional(),
+      employeeGroupId: recordId('Only this employee group.').optional(),
+      status: z.enum(SHIFT_STATUSES.slice(0, 8) as [string, ...string[]]).optional().describe('Only shifts with this status.'),
+      ...pageShape(200),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed shifts.',
+    upstream: [{ access: 'read', method: 'GET', path: '/scheduling/v1.0/shifts' }],
+    check: period,
+    handler: async (client, input) => listShifts(client, input),
+  }),
+  defineTool({
+    name: 'planday_get_shift',
+    title: 'Get shift (Planday)',
+    description: 'One shift with its breaks. No wages.',
+    inputShape: { shiftId: recordId('The shift id.') },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Fetched shift.',
+    upstream: [{ access: 'read', method: 'GET', path: '/scheduling/v1.0/shifts/{shiftId}' }],
+    handler: async (client, input) => getShift(client, input),
+  }),
+  defineTool({
+    name: 'planday_list_shift_types',
+    title: 'List shift types (Planday)',
+    description: 'Shift types: name, colour, whether active and whether breaks and booking are allowed. Salary codes and pay supplements are left out.',
+    inputShape: { activeOnly: z.boolean().optional().describe('Only active (true) or inactive (false) types.'), ...pageShape(50) },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed shift types.',
+    upstream: [{ access: 'read', method: 'GET', path: '/scheduling/v1.0/shifttypes' }],
+    handler: async (client, input) => listShiftTypes(client, input),
+  }),
+  defineTool({
+    name: 'planday_list_positions',
+    title: 'List positions (Planday)',
+    description: 'Schedule positions: name, department, section, employee group and period. Revenue settings are left out.',
+    inputShape: { activeOnly: z.boolean().optional().describe('Only active (true) or inactive (false) positions.'), ...pageShape(50) },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed positions.',
+    upstream: [{ access: 'read', method: 'GET', path: '/scheduling/v1.0/positions' }],
+    handler: async (client, input) => listPositions(client, input),
+  }),
+  defineTool({
+    name: 'planday_list_shift_requests',
+    title: 'List shift requests (Planday)',
+    description:
+      'Shifts that employees have asked to take, from 7 days ago on, for the departments given: the shift and who asked, oldest first. The app needs permission to approve shift requests in every department given.',
+    inputShape: {
+      departmentIds: z.array(recordId('A department id.')).min(1).max(50).describe('The departments, 1 to 50.'),
+      ...pageShape(50),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed shift requests.',
+    upstream: [{ access: 'read', method: 'GET', path: '/scheduling/v1.0/shifts/requests' }],
+    handler: async (client, input) => listShiftRequests(client, input),
+  }),
+  defineTool({
+    name: 'planday_list_punch_clock_records',
+    title: 'List punch clock records (Planday)',
+    description:
+      'Punch clock records between two dates (at most 62 days): employee, shift, department, punched in and out, the planned shift times, the description and whether approved.',
+    inputShape: {
+      from: dateSchema.describe('First date, YYYY-MM-DD.'),
+      to: dateSchema.describe('Last date, YYYY-MM-DD.'),
+      employeeId: recordId('Only this employee.').optional(),
+      shiftId: recordId('Only this shift.').optional(),
+      ...pageShape(200),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed punch clock records.',
+    upstream: [{ access: 'read', method: 'GET', path: '/punchclock/v1.0/punchclockshifts' }],
+    check: period,
+    handler: async (client, input) => listPunchClockRecords(client, input),
+  }),
+
+  // -------------------------------------------------------------------------
+  // Writes. No tool deletes, publishes, approves a shift for payroll, swaps, punches in or out, changes an
+  // employee, sets or reads a wage, or notifies anyone.
+
+  defineTool({
+    name: 'planday_create_shift',
+    title: 'Create draft shift (Planday)',
+    description: `Create a shift as a draft: employees do not see it until someone publishes the schedule in Planday. Planday refuses a shift that conflicts with others, and the department's break rules apply. No wage is set. ${WRITE_NOTE}`,
+    inputShape: {
+      departmentId: recordId('The department.'),
+      employeeGroupId: recordId('The employee group the shift belongs to.'),
+      date: dateSchema.describe('The date of the shift, YYYY-MM-DD.'),
+      startTime: timeSchema.describe('Start, HH:MM.'),
+      endTime: timeSchema.describe('End, HH:MM (an end before the start means the next day).'),
+      employeeId: recordId('The employee to assign (left out: an open shift).').optional(),
+      positionId: recordId('The position.').optional(),
+      shiftTypeId: recordId('The shift type.').optional(),
+      comment: z.string().trim().min(1).max(1000).optional().describe('A comment managers and employees can see.'),
     },
     annotations: WRITE_TOOL_ANNOTATIONS,
     returnsUpstreamContent: true,
-    summary: 'Created item.',
-    upstream: [{ access: 'write', method: 'POST', path: '/items' }],
-    handler: async (client, input) => createItem(client, input),
+    summary: 'Created draft shift.',
+    upstream: [{ access: 'write', method: 'POST', path: '/scheduling/v1.0/shifts' }],
+    change: change('create', 'shift', {
+      departmentId: 'recordId',
+      employeeGroupId: 'recordId',
+      employeeId: 'recordId',
+      positionId: 'recordId',
+      shiftTypeId: 'recordId',
+      date: 'date',
+      startTime: 'time',
+      endTime: 'time',
+    }),
+    check: input => (isTime(input.startTime) && input.startTime === input.endTime ? 'The shift has no length: start and end are the same.' : undefined),
+    handler: async (client, input) => createShift(client, input),
+  }),
+  defineTool({
+    name: 'planday_assign_shift',
+    title: 'Assign shift (Planday)',
+    description: `Give a shift to an employee, or make it open (employeeId null). Nothing else on the shift changes. Reads the shift back to confirm. ${WRITE_NOTE}`,
+    inputShape: {
+      shiftId: recordId('The shift.'),
+      employeeId: z.union([recordId('The employee.'), z.null()]).describe('The employee, or null for an open shift.'),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Assigned shift.',
+    upstream: [
+      { access: 'write', method: 'POST', path: '/scheduling/v1.0/shifts/{shiftId}/employee' },
+      { access: 'read', method: 'GET', path: '/scheduling/v1.0/shifts/{shiftId}' },
+    ],
+    change: change('assign', 'shift', { shiftId: 'recordId', employeeId: 'recordId' }),
+    handler: async (client, input) => assignShift(client, input),
+  }),
+  defineTool({
+    name: 'planday_approve_shift_request',
+    title: 'Approve shift request (Planday)',
+    description: `Approve an employee's request for a shift (from list_shift_requests): Planday gives them the shift and keeps its other details, and refuses when the employee has no pending request or it would break a conflict or labour rule. No SMS or message is sent. ${WRITE_NOTE}`,
+    inputShape: {
+      shiftId: recordId('The shift.'),
+      employeeId: recordId('The employee who asked for it.'),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Approved shift request.',
+    upstream: [
+      { access: 'write', method: 'POST', path: '/scheduling/v1.0/shifts/{shiftId}/requests/{employeeId}/approve' },
+      { access: 'read', method: 'GET', path: '/scheduling/v1.0/shifts/{shiftId}' },
+    ],
+    change: change('approve_request', 'shift', { shiftId: 'recordId', employeeId: 'recordId' }),
+    handler: async (client, input) => approveShiftRequest(client, input),
   }),
 ];
 
+/**
+ * Validate a write call's input exactly as executeTool does before it sends
+ * anything: the strict schema, then the tool's own cross-field check. Used
+ * by the change resolution, so a call it accepts is one that would run.
+ */
+export function validateCall(tool: ToolDefinition, input: unknown): { ok: true; data: Record<string, unknown> } | { ok: false } {
+  const parsed = tool.inputSchema.safeParse(input ?? {});
+  if (!parsed.success) return { ok: false };
+  const data = parsed.data as Record<string, unknown>;
+  return tool.check?.(data) ? { ok: false } : { ok: true, data };
+}
+
 export function findTool(name: string): ToolDefinition | undefined {
   return PLANDAY_TOOLS.find(tool => tool.name === name);
+}
+
+/** The pseudonym of a value: HMAC-SHA-256 with the host's key, else SHA-256; 16 hex characters with a prefix. */
+export function pseudonym(value: string, key?: string | Uint8Array): string {
+  if (key !== undefined && key.length > 0) {
+    return `hmac:${createHmac('sha256', key).update(value).digest('hex').slice(0, 16)}`;
+  }
+  return `sha256:${createHash('sha256').update(value).digest('hex').slice(0, 16)}`;
+}
+
+const KIND_VALUES = /^[A-Za-z][A-Za-z_-]{0,19}$/;
+
+/**
+ * The value of one log field when it has exactly the field's type; otherwise
+ * undefined. A number the company chose comes back only as a pseudonym.
+ */
+export function logFieldValue(
+  type: PlandayLogFieldType,
+  value: unknown,
+  pseudonymKey?: string | Uint8Array,
+): string | number | boolean | undefined {
+  switch (type) {
+    case 'recordId':
+      return isRecordId(value) ? value : undefined;
+    case 'date':
+      return isIsoDate(value) ? value : undefined;
+    case 'time':
+      return isTime(value) ? value : undefined;
+    case 'count':
+      return Array.isArray(value) ? value.length : undefined;
+    case 'flag':
+      return typeof value === 'boolean' ? value : undefined;
+    case 'kind':
+      return typeof value === 'string' && KIND_VALUES.test(value) ? value : undefined;
+    case 'pseudonym':
+      return typeof value === 'string' && value.length > 0 && value.length <= 100 ? pseudonym(value, pseudonymKey) : undefined;
+    default:
+      return undefined;
+  }
 }
 
 /** Validate the tool policy environment. Cheap; runs for every server instance. */
@@ -150,16 +495,19 @@ export function registerTools(server: McpServer, client: RedactingClient): void 
         annotations: tool.annotations,
       },
       async (input: Record<string, unknown>) => {
+        let result: { content: Array<{ type: 'text'; text: string }>; isError?: true };
         try {
           // In a scope with this server's redactor, like a gateway call: audit records and context are redacted.
-          return mcpToolResult(tool, await runInCallScope({ redactor: client.redactor }, () => executeTool(tool, client, input)));
+          const data = await runInCallScope({ redactor: client.redactor }, () => executeTool(tool, client, input));
+          // Planday data can echo a token, in values or in object keys: redacted as data before it is serialised (a
+          // serialised token is escaped and no longer matches), as on the gateway.
+          result = mcpToolResult(tool, redactDeep(redactDeep(data, client.redactor), client.redactor));
         } catch (error) {
           // Central redaction with this instance's secrets: no error text reaches the client unredacted.
-          return {
-            isError: true,
-            content: [{ type: 'text' as const, text: formatUnknownError(error, client.redactor) }],
-          };
+          result = { isError: true, content: [{ type: 'text' as const, text: formatUnknownError(error, client.redactor) }] };
         }
+        // The same last check as the gateway: a result that still holds a piece of the token is withheld whole.
+        return leaksSecret(result, client.redactor) ? withheldResult() : result;
       },
     );
   }
@@ -182,12 +530,23 @@ function contextString(value: unknown, max: number): string | undefined {
   return trimmed ? trimmed.slice(0, max) : undefined;
 }
 
-/** Normalise a host-supplied context; malformed values are ignored. */
+/**
+ * The audit's view of a call context. Nothing the host sends is kept in
+ * clear: a request id may be any text (a name, a phone number, an address),
+ * so the audit keeps its pseudonym, which still ties the lines of one call
+ * together for the host that knows the key; without a request id the audit
+ * makes one. The caller becomes a pseudonym the same way. Both are keyed
+ * with the host's policy.pseudonymKey when given.
+ */
 export function normaliseCallContext(context: unknown): { requestId: string; caller?: string } {
   const value = (context && typeof context === 'object' ? context : {}) as Record<string, unknown>;
+  const key = currentInstancePolicy()?.pseudonymKey;
+  const given = typeof value.requestId === 'string' && value.requestId.length > 0 ? value.requestId.slice(0, 1000) : undefined;
+  const requestId = given === undefined ? newRequestId() : pseudonym(given, key);
+  const caller = contextString(value.caller, 320);
   return {
-    requestId: contextString(value.requestId, 200) ?? newRequestId(),
-    caller: contextString(value.caller, 320),
+    requestId,
+    ...(caller === undefined ? {} : { caller: pseudonym(caller, key) }),
   };
 }
 
@@ -207,12 +566,11 @@ export async function executeTool(
 
   const policy = checkToolPolicy(tool.name, tool.annotations.readOnlyHint);
   const inputPolicy = policy.allowed ? checkInputPolicy(tool.name, input) : policy;
-  if (!inputPolicy.allowed) {
-    await writeAuditEvent(
-      { requestId, tool: tool.name, caller, action: 'policy_denied', target, reason: inputPolicy.reason },
-      { redactor },
-    );
-    throw new Error(inputPolicy.reason);
+  const refusal = inputPolicy.allowed ? tool.check?.(input) : undefined;
+  if (!inputPolicy.allowed || refusal) {
+    const reason = inputPolicy.allowed ? (refusal as string) : inputPolicy.reason;
+    await writeAuditEvent({ requestId, tool: tool.name, caller, action: 'policy_denied', target, reason }, { redactor });
+    throw new Error(reason);
   }
 
   // Write tools fail closed: no write runs without its start record.
@@ -250,31 +608,39 @@ export async function executeTool(
   }
 }
 
-const MAX_REJECTED_FIELDS = 20;
-const MAX_REJECTED_FIELD_LENGTH = 64;
+/** Why a call was rejected before it ran: a fixed code, never text from the caller. */
+export type RejectionCode = 'unknown_tool' | 'invalid_input';
 
-/** Audit a call rejected before execution (unknown tool or invalid input); field names only. */
+/**
+ * Audit a call rejected before execution (unknown tool or invalid input).
+ * The record holds only what we wrote: a known tool name (an unknown one is
+ * recorded as `unknown` with a pseudonym of what was given), the argument
+ * names that the tool's schema knows, the number of other arguments, and a
+ * fixed code. A caller can put a name or a text anywhere, so nothing it
+ * chose is logged in clear.
+ */
 export async function auditRejectedCall(
   toolName: string,
   input: unknown,
-  reason: string,
+  code: RejectionCode,
   context?: unknown,
 ): Promise<void> {
   const { requestId, caller } = normaliseCallContext(context);
-  const fields =
-    input && typeof input === 'object' && !Array.isArray(input)
-      ? Object.keys(input)
-          .sort()
-          .slice(0, MAX_REJECTED_FIELDS)
-          .map(key => redactInScope(key).slice(0, MAX_REJECTED_FIELD_LENGTH))
-      : [];
+  const tool = typeof toolName === 'string' ? findTool(toolName) : undefined;
+  const known = new Set(tool ? Object.keys(tool.inputShape) : []);
+  const keys = input && typeof input === 'object' && !Array.isArray(input) ? Object.keys(input) : [];
+  const fields = keys.filter(key => known.has(key)).sort();
   await writeAuditEvent({
     requestId,
-    tool: redactInScope(toolName).slice(0, 100),
+    tool: tool ? tool.name : 'unknown',
     caller,
     action: 'rejected',
-    target: { fields },
-    reason: redactInScope(reason).slice(0, 200),
+    target: {
+      ...(tool ? {} : { toolPseudonym: pseudonym(String(toolName).slice(0, 200)) }),
+      fields,
+      otherFields: keys.length - fields.length,
+    },
+    reason: code,
   });
 }
 
