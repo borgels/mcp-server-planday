@@ -28,3 +28,8 @@ export function isTime(value: unknown): value is string {
 export function daysBetween(from: string, to: string): number {
   return Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000);
 }
+
+/** A local date and time written YYYY-MM-DDTHH:MM (24-hour, no offset), on a date that exists. */
+export function isLocalDateTime(value: unknown): value is string {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d$/.test(value) && isIsoDate(value.slice(0, 10));
+}

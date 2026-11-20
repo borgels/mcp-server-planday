@@ -13,6 +13,16 @@ import { formatUnknownError, redactDeep, type SecretRedactor } from '../errors.j
 import { withheldResult } from '../fallbacks.js';
 import { leaksSecret } from '../key-admission.js';
 import {
+  ABSENCE_REQUEST_STATUSES,
+  ABSENCE_TYPES,
+  approveAbsenceRequest,
+  approvePunchClock,
+  deleteDraftShift,
+  listAbsenceAccounts,
+  listAbsenceRequests,
+  registerAbsence,
+  setPunchOut,
+  updateDraftShift,
   approveShiftRequest,
   assignShift,
   checkConnection,
@@ -38,7 +48,7 @@ import {
   runInCallScope,
   validatePolicyConfig,
 } from '../planday/policy.js';
-import { daysBetween, isIsoDate, isRecordId, isTime, TIME_PATTERN } from '../planday/values.js';
+import { daysBetween, isIsoDate, isLocalDateTime, isRecordId, isTime, TIME_PATTERN } from '../planday/values.js';
 
 type ToolAnnotations = typeof READ_TOOL_ANNOTATIONS | typeof WRITE_TOOL_ANNOTATIONS;
 
@@ -50,7 +60,7 @@ type ToolAnnotations = typeof READ_TOOL_ANNOTATIONS | typeof WRITE_TOOL_ANNOTATI
  */
 export interface UpstreamOperation {
   access: 'read' | 'write';
-  method: 'GET' | 'POST' | 'PUT';
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
   path: string;
 }
 
@@ -60,16 +70,17 @@ export interface RedactingClient extends UpstreamClient {
 }
 
 /** What a write tool does. */
-export type PlandayChangeAction = 'create' | 'assign' | 'approve_request';
+export type PlandayChangeAction = 'create' | 'assign' | 'approve_request' | 'update' | 'delete' | 'approve' | 'punch_out' | 'register';
 
 /** The kind of record a write tool touches. */
-export type PlandayChangeRecord = 'shift';
+export type PlandayChangeRecord = 'shift' | 'punch_clock' | 'absence';
 
 /**
  * The type a logged value must have; anything else is left out of the values.
  *   recordId  a Planday id (a positive integer), in clear
  *   date      a date YYYY-MM-DD, in clear
  *   time      a time HH:MM, in clear
+ *   dateTime  a local date and time YYYY-MM-DDTHH:MM, in clear
  *   count     the number of entries in a list, never the entries
  *   flag      true or false, in clear
  *   kind      one value from a fixed list the tool's schema allows, in clear
@@ -77,7 +88,7 @@ export type PlandayChangeRecord = 'shift';
  *             16 hex characters, or "hmac:" with a key from the host.
  * Names, e-mail addresses, comments and other free text are never log fields.
  */
-export type PlandayLogFieldType = 'recordId' | 'date' | 'time' | 'count' | 'flag' | 'kind' | 'pseudonym';
+export type PlandayLogFieldType = 'recordId' | 'date' | 'time' | 'dateTime' | 'count' | 'flag' | 'kind' | 'pseudonym';
 
 export interface PlandayLogField {
   readonly name: string;
@@ -92,7 +103,7 @@ export interface PlandayLogField {
 export interface PlandayChangeSpec {
   readonly action: PlandayChangeAction;
   readonly record: PlandayChangeRecord;
-  /** Always false: no tool moves money or touches wages. */
+  /** Always false: no tool moves money or sets a wage. */
   readonly movesMoney: false;
   readonly logFields: readonly PlandayLogField[];
 }
@@ -159,12 +170,23 @@ const change = (
 const recordId = (what: string) => z.number().int().positive().max(Number.MAX_SAFE_INTEGER).describe(what);
 const dateSchema = z.string().trim().refine(isIsoDate, 'must be a date written YYYY-MM-DD');
 const timeSchema = z.string().trim().regex(TIME_PATTERN, 'must be a time written HH:MM');
+const dateTimeSchema = z.string().trim().refine(isLocalDateTime, 'must be a local date and time written YYYY-MM-DDTHH:MM');
+/** At most this many days of absence in one registration, both dates included. */
+const MAX_ABSENCE_DAYS = 366;
 const pageShape = (max: number) => ({
   offset: z.number().int().min(0).max(1_000_000).optional().describe('Skip this many records (default 0).'),
   limit: z.number().int().min(1).max(max).optional().describe(`Records per page (default 50, at most ${max}).`),
 });
 /** At most this many days per shift or punch clock query, both dates included. */
 const MAX_PERIOD_DAYS = 62;
+
+function absencePeriod(input: Record<string, unknown>): string | undefined {
+  const days = daysBetween(String(input.from), String(input.to));
+  if (days < 0) return 'to is before from.';
+  if (days + 1 > MAX_ABSENCE_DAYS) return `Register at most ${MAX_ABSENCE_DAYS} days at a time.`;
+  if ((input.accountId === undefined) === (input.absenceType === undefined)) return 'Give either accountId or absenceType, not both.';
+  return undefined;
+}
 
 function period(input: Record<string, unknown>): string | undefined {
   const from = String(input.from);
@@ -335,8 +357,46 @@ export const PLANDAY_TOOLS: ToolDefinition[] = [
   }),
 
   // -------------------------------------------------------------------------
-  // Writes. No tool deletes, publishes, approves a shift for payroll, swaps, punches in or out, changes an
-  // employee, sets or reads a wage, or notifies anyone.
+  defineTool({
+    name: 'planday_list_absence_accounts',
+    title: 'List absence accounts (Planday)',
+    description:
+      "One employee's absence accounts (holiday, sickness, time off in lieu and so on): id, name, type, whether active and the period it is valid. Salary codes are left out.",
+    inputShape: {
+      employeeId: recordId('The employee.'),
+      activeOnly: z.boolean().optional().describe('Only active (true) or inactive (false) accounts.'),
+      ...pageShape(50),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed absence accounts.',
+    upstream: [{ access: 'read', method: 'GET', path: '/absence/v1.0/accounts' }],
+    handler: async (client, input) => listAbsenceAccounts(client, input),
+  }),
+  defineTool({
+    name: 'planday_list_absence_requests',
+    title: 'List absence requests (Planday)',
+    description:
+      "Absence requests: employee, period, status (Submitted, Declined, Approved, Cancelled) and the accounts asked for. The employee's note is left out, since it can say why they are away.",
+    inputShape: {
+      employeeId: recordId('Only this employee.').optional(),
+      statuses: z.array(z.enum(ABSENCE_REQUEST_STATUSES)).min(1).max(4).optional().describe('Only requests with these statuses.'),
+      from: dateSchema.describe('Only requests ending on this date or later, YYYY-MM-DD.').optional(),
+      to: dateSchema.describe('Only requests starting on this date or earlier, YYYY-MM-DD.').optional(),
+      ...pageShape(50),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed absence requests.',
+    upstream: [{ access: 'read', method: 'GET', path: '/absence/v1.0/absencerequests' }],
+    check: input =>
+      typeof input.from === 'string' && typeof input.to === 'string' && daysBetween(input.from, input.to) < 0 ? 'to is before from.' : undefined,
+    handler: async (client, input) => listAbsenceRequests(client, input),
+  }),
+
+  // -------------------------------------------------------------------------
+  // Writes. No tool publishes the schedule, changes or deletes a published shift, swaps, punches in, changes an
+  // employee or an absence account, sets or reads a wage, or notifies anyone. The only deletion is of a draft shift.
 
   defineTool({
     name: 'planday_create_shift',
@@ -406,6 +466,145 @@ export const PLANDAY_TOOLS: ToolDefinition[] = [
     change: change('approve_request', 'shift', { shiftId: 'recordId', employeeId: 'recordId' }),
     handler: async (client, input) => approveShiftRequest(client, input),
   }),
+  defineTool({
+    name: 'planday_update_draft_shift',
+    title: 'Change draft shift (Planday)',
+    description: `Change a shift that is still a draft (not yet published): date, times, employee, employee group, position, shift type or comment. A field left out keeps its value; null empties employee, position, shift type or comment. The shift is read first and refused if it is published. It stays a draft, Planday refuses a change that conflicts with other shifts, and the department's break rules apply. No wage is set. ${WRITE_NOTE}`,
+    inputShape: {
+      shiftId: recordId('The draft shift.'),
+      date: dateSchema.describe('New date, YYYY-MM-DD.').optional(),
+      startTime: timeSchema.describe('New start, HH:MM.').optional(),
+      endTime: timeSchema.describe('New end, HH:MM (an end before the start means the next day).').optional(),
+      employeeId: z.union([recordId('The employee.'), z.null()]).optional().describe('The employee, or null for an open shift.'),
+      employeeGroupId: recordId('The employee group.').optional(),
+      positionId: z.union([recordId('The position.'), z.null()]).optional().describe('The position, or null for none.'),
+      shiftTypeId: z.union([recordId('The shift type.'), z.null()]).optional().describe('The shift type, or null for none.'),
+      comment: z
+        .union([z.string().trim().min(1).max(1000), z.null()])
+        .optional()
+        .describe('A comment managers and employees can see, or null to remove it.'),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Changed draft shift.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/scheduling/v1.0/shifts/{shiftId}' },
+      { access: 'write', method: 'PUT', path: '/scheduling/v1.0/shifts/{shiftId}' },
+    ],
+    change: change('update', 'shift', {
+      shiftId: 'recordId',
+      date: 'date',
+      startTime: 'time',
+      endTime: 'time',
+      employeeId: 'recordId',
+      employeeGroupId: 'recordId',
+      positionId: 'recordId',
+      shiftTypeId: 'recordId',
+    }),
+    check: input =>
+      Object.keys(input).filter(key => key !== 'shiftId' && input[key] !== undefined).length === 0
+        ? 'Nothing to change: give at least one field besides shiftId.'
+        : isTime(input.startTime) && input.startTime === input.endTime
+          ? 'The shift has no length: start and end are the same.'
+          : undefined,
+    handler: async (client, input) => updateDraftShift(client, input),
+  }),
+  defineTool({
+    name: 'planday_delete_draft_shift',
+    title: 'Delete draft shift (Planday)',
+    description: `Delete a shift that is still a draft (not yet published): no employee has seen it and nobody has worked it. The shift is read first and refused if it is published. A published or worked shift is never deleted. ${WRITE_NOTE}`,
+    inputShape: { shiftId: recordId('The draft shift.') },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Deleted draft shift.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/scheduling/v1.0/shifts/{shiftId}' },
+      { access: 'write', method: 'DELETE', path: '/scheduling/v1.0/shifts/{shiftId}' },
+    ],
+    change: change('delete', 'shift', { shiftId: 'recordId' }),
+    handler: async (client, input) => deleteDraftShift(client, input),
+  }),
+  defineTool({
+    name: 'planday_approve_punch_clock',
+    title: 'Approve punch clock record (Planday)',
+    description: `Approve the punch clock record of a worked shift on the employee's timesheet, so it is ready for payroll in Planday. By default the punched times are approved; start and end correct them, for example a forgotten or wrong punch-in or punch-out. The shift's record is read first: it must be punched in and out and not yet approved, and the end must be after the start. It is read again afterwards and must show it approved. No note or comment is sent, no wage is set and nothing is paid. ${WRITE_NOTE}`,
+    inputShape: {
+      shiftId: recordId('The worked shift (from list_shifts or list_punch_clock_records).'),
+      start: dateTimeSchema.describe('The start to approve, local date and time YYYY-MM-DDTHH:MM (default: the punch-in).').optional(),
+      end: dateTimeSchema.describe('The end to approve, local date and time YYYY-MM-DDTHH:MM (default: the punch-out).').optional(),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Approved punch clock record.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/scheduling/v1.0/shifts/{shiftId}' },
+      { access: 'read', method: 'GET', path: '/punchclock/v1.0/punchclockshifts/byShift/{shiftId}' },
+      { access: 'write', method: 'POST', path: '/timesheet/v1.0/timesheets/approve/simple' },
+    ],
+    change: change('approve', 'punch_clock', { shiftId: 'recordId', start: 'dateTime', end: 'dateTime' }),
+    check: input =>
+      typeof input.start === 'string' && typeof input.end === 'string' && input.end <= input.start ? 'The end must be after the start.' : undefined,
+    handler: async (client, input) => approvePunchClock(client, input),
+  }),
+  defineTool({
+    name: 'planday_set_punch_out',
+    title: 'Set punch-out time (Planday)',
+    description: `Set or correct when an employee punched out of a shift, for example when they forgot to punch out. The shift's punch clock record is read first; an approved record is not changed, and the punch-out must be after the punch-in. The time is the portal's local time. To correct the punch-in, approve the record with approve_punch_clock and the right start. ${WRITE_NOTE}`,
+    inputShape: {
+      shiftId: recordId('The shift the punch clock record belongs to.'),
+      end: dateTimeSchema.describe('The punch-out, local date and time YYYY-MM-DDTHH:MM.'),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Set punch-out time.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/punchclock/v1.0/punchclockshifts/byShift/{shiftId}' },
+      { access: 'write', method: 'PUT', path: '/punchclock/v1.0/punchclockshifts' },
+    ],
+    change: change('punch_out', 'punch_clock', { shiftId: 'recordId', end: 'dateTime' }),
+    handler: async (client, input) => setPunchOut(client, input),
+  }),
+  defineTool({
+    name: 'planday_register_absence',
+    title: 'Register absence (Planday)',
+    description: `Register an employee's absence from one date to another (both included), on an absence account (accountId, from list_absence_accounts) or by type (absenceType): Planday makes the request as it would for the employee, and it is approved at once. Nobody is notified, the employee's shifts in the period are left as they are, and no open shift is made. No note is sent. ${WRITE_NOTE}`,
+    inputShape: {
+      employeeId: recordId('The employee.'),
+      from: dateSchema.describe('First day of absence, YYYY-MM-DD.'),
+      to: dateSchema.describe('Last day of absence, YYYY-MM-DD.'),
+      accountId: recordId('The absence account (from list_absence_accounts).').optional(),
+      absenceType: z.enum(ABSENCE_TYPES).optional().describe('The type of absence, when no account is given.'),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Registered absence.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/absence/v1.0/absencerequests/draft' },
+      { access: 'write', method: 'POST', path: '/absence/v1.0/absencerequests' },
+      { access: 'write', method: 'PUT', path: '/absence/v1.0/absencerequests/{requestId}/approve' },
+    ],
+    change: change('register', 'absence', {
+      employeeId: 'recordId',
+      from: 'date',
+      to: 'date',
+      accountId: 'recordId',
+      absenceType: 'kind',
+    }),
+    check: absencePeriod,
+    handler: async (client, input) => registerAbsence(client, input),
+  }),
+  defineTool({
+    name: 'planday_approve_absence_request',
+    title: 'Approve absence request (Planday)',
+    description: `Approve an employee's absence request (from list_absence_requests). Nobody is notified, the employee's shifts in the period are left as they are, and no open shift is made. Planday refuses a request that does not exist. ${WRITE_NOTE}`,
+    inputShape: { requestId: recordId('The absence request.') },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Approved absence request.',
+    upstream: [{ access: 'write', method: 'PUT', path: '/absence/v1.0/absencerequests/{requestId}/approve' }],
+    change: change('approve', 'absence', { requestId: 'recordId' }),
+    handler: async (client, input) => approveAbsenceRequest(client, input),
+  }),
 ];
 
 /**
@@ -450,6 +649,8 @@ export function logFieldValue(
       return isIsoDate(value) ? value : undefined;
     case 'time':
       return isTime(value) ? value : undefined;
+    case 'dateTime':
+      return isLocalDateTime(value) ? value : undefined;
     case 'count':
       return Array.isArray(value) ? value.length : undefined;
     case 'flag':

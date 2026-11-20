@@ -58,7 +58,7 @@ export interface PlandayClientOptions {
 
 export type QueryValue = string | number | boolean | null | undefined | readonly (string | number)[];
 
-type HttpMethod = 'GET' | 'POST' | 'PUT';
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
 
 /**
  * The header that carries the access token ("Authorization: Bearer ...",
@@ -79,13 +79,23 @@ export const DEFAULT_TOKEN_URL = `https://${TOKEN_HOST}/connect/token`;
 
 /**
  * The only writes the client sends: method and path (relative to the base
- * URL). Anything else, a DELETE among them, is refused before it is sent,
- * whatever a tool or a policy says. The client has no delete method at all.
+ * URL). Anything else is refused before it is sent, whatever a tool or a
+ * policy says. The only DELETE is of one shift, which the tool sends only
+ * after reading it as a draft.
  */
-export const ALLOWED_WRITES: ReadonlyArray<{ method: 'POST' | 'PUT'; path: RegExp }> = [
+export const ALLOWED_WRITES: ReadonlyArray<{ method: 'POST' | 'PUT' | 'DELETE'; path: RegExp }> = [
   { method: 'POST', path: /^\/scheduling\/v1\.0\/shifts$/ },
   { method: 'POST', path: /^\/scheduling\/v1\.0\/shifts\/\d+\/employee$/ },
   { method: 'POST', path: /^\/scheduling\/v1\.0\/shifts\/\d+\/requests\/\d+\/approve$/ },
+  // A draft shift: the tools read it first and send these only while it is a draft.
+  { method: 'PUT', path: /^\/scheduling\/v1\.0\/shifts\/\d+$/ },
+  { method: 'DELETE', path: /^\/scheduling\/v1\.0\/shifts\/\d+$/ },
+  // Approve a punched-out shift on the timesheet, and set the punch-out time of a record.
+  { method: 'POST', path: /^\/timesheet\/v1\.0\/timesheets\/approve\/simple$/ },
+  { method: 'PUT', path: /^\/punchclock\/v1\.0\/punchclockshifts$/ },
+  // Absence: submit a request on an employee's behalf, and approve a request.
+  { method: 'POST', path: /^\/absence\/v1\.0\/absencerequests$/ },
+  { method: 'PUT', path: /^\/absence\/v1\.0\/absencerequests\/\d+\/approve$/ },
 ];
 
 /** An access token is renewed this long before it expires. */
@@ -145,6 +155,7 @@ export interface UpstreamClient {
   get<T>(path: string, query?: Record<string, QueryValue>): Promise<T>;
   post<T>(path: string, body?: unknown, query?: Record<string, QueryValue>): Promise<T>;
   put<T>(path: string, body?: unknown): Promise<T>;
+  delete<T>(path: string): Promise<T>;
 }
 
 /**
@@ -160,6 +171,7 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
     get: (path, query) => client.get(path, query),
     post: refuse('POST'),
     put: refuse('PUT'),
+    delete: refuse('DELETE'),
   };
 }
 
@@ -252,6 +264,10 @@ export class PlandayClient implements UpstreamClient {
 
   async put<T>(path: string, body?: unknown): Promise<T> {
     return this.request<T>('PUT', this.buildUrl(path), body);
+  }
+
+  async delete<T>(path: string): Promise<T> {
+    return this.request<T>('DELETE', this.buildUrl(path));
   }
 
   /** A query value that is a list is sent as the parameter repeated, as the Open API takes arrays (e.g. departmentId). */

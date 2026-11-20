@@ -52,7 +52,8 @@ import {
  * instance.
  *
  * What no policy can turn on: a request outside the client's fixed list of
- * writes (src/planday/client.ts, ALLOWED_WRITES). There is no DELETE, and no
+ * writes (src/planday/client.ts, ALLOWED_WRITES). The only DELETE is of one
+ * shift, which the tool sends only after reading it as a draft; there is no
  * tool that reads or changes wages, pay rates, salary codes, CPR numbers,
  * bank accounts or birth dates, or changes an employee.
  */

@@ -136,7 +136,7 @@ function errorFields(summary: ReturnType<typeof auditErrorSummary>) {
   return { httpStatus: summary.httpStatus, error: summary.message };
 }
 
-/** Fields logged in clear text: Planday ids, dates, times, statuses and flags. Input is validated before it is audited. */
+/** Fields logged in clear text: Planday ids, dates, times, statuses, kinds and flags. Input is validated before it is audited. */
 const ID_FIELDS = [
   'employeeId',
   'shiftId',
@@ -152,6 +152,12 @@ const ID_FIELDS = [
   'endTime',
   'from',
   'to',
+  'start',
+  'end',
+  'requestId',
+  'accountId',
+  'absenceType',
+  'statuses',
   'offset',
   'limit',
 ] as const;
