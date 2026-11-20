@@ -377,7 +377,7 @@ export const PLANDAY_TOOLS: ToolDefinition[] = [
     name: 'planday_list_absence_requests',
     title: 'List absence requests (Planday)',
     description:
-      "Absence requests: employee, period, status (Submitted, Declined, Approved, Cancelled) and the accounts asked for. The employee's note is left out, since it can say why they are away.",
+      "Absence requests: employee, period and status (Submitted, Declined, Approved, Cancelled). The employee's note and the accounts asked for are left out, since they say why the employee is away.",
     inputShape: {
       employeeId: recordId('Only this employee.').optional(),
       statuses: z.array(z.enum(ABSENCE_REQUEST_STATUSES)).min(1).max(4).optional().describe('Only requests with these statuses.'),

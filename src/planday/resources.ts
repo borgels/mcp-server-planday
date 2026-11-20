@@ -630,17 +630,17 @@ const absenceAccount = z.object({
   validityPeriod: range.nullable().optional(),
 });
 
-/** An absence request without its note: the note is the employee's own text and can say why they are away. */
+/**
+ * An absence request without its note and without the accounts it is asked
+ * on: the note is the employee's own text, and an account's name (for
+ * example sickness) says why they are away. Both are health data at worst;
+ * the request is shown with its employee, period and status.
+ */
 const absenceRequest = z.object({
   id,
   employeeId: id,
   absencePeriod: range.nullable().optional(),
   status: z.enum(ABSENCE_REQUEST_STATUSES).nullable().optional(),
-  requestedAccounts: z
-    .array(z.object({ id, name: text(500).nullable().optional() }))
-    .max(100)
-    .nullable()
-    .optional(),
 });
 
 /** The accounts an employee's absence is counted on (holiday, sickness and so on), a page at a time. */

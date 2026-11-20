@@ -101,7 +101,7 @@ export const FIXED_CORPUS: readonly string[] = [
   "A name or an e-mail address to search for. No digits: Planday also searches CPR numbers and salary identifiers.",
   "AbortError",
   "Absence",
-  "Absence requests: employee, period, status (Submitted, Declined, Approved, Cancelled) and the accounts asked for. The employee's note is left out, since it can say why they are away.",
+  "Absence requests: employee, period and status (Submitted, Declined, Approved, Cancelled). The employee's note and the accounts asked for are left out, since they say why the employee is away.",
   "AbsenceNotApprovedError",
   "Access-Control-Allow-Headers",
   "Access-Control-Allow-Methods",

@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-planday",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "mcpName": "io.github.borgels/mcp-server-planday",
   "description": "Unofficial MCP server for the Planday Open API: departments, employees, schedule and punch clock.",
   "type": "module",

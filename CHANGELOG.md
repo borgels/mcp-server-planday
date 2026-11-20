@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- `list_absence_requests` leaves out the accounts a request is asked on
+  (`requestedAccounts`): an account's name, such as sickness, says why the
+  employee is away (#11). A request is shown with its employee, period and
+  status.
+
 ## 0.2.0
 
 The everyday changes of a shift planner (#8), after Planday's OpenAPI

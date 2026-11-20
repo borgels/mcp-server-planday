@@ -344,16 +344,26 @@ describe('approve_absence_request', () => {
 });
 
 describe('absence reads', () => {
-  it('lists absence requests without the employee’s note', async () => {
+  it('lists absence requests without the employee’s note or the accounts, which say why they are away', async () => {
     const { gw, calls } = planday({
       'GET /absence/v1.0/absencerequests': {
-        data: [{ id: 81, employeeId: 7, note: 'Mette er syg med influenza', status: 'Submitted', absencePeriod: { start: '2026-11-23', end: '2026-11-24' } }],
+        data: [
+          {
+            id: 81,
+            employeeId: 7,
+            note: 'Mette er syg med influenza',
+            status: 'Submitted',
+            absencePeriod: { start: '2026-11-23', end: '2026-11-24' },
+            requestedAccounts: [{ id: 61, name: 'Sygdom', cost: [{ value: 2, unit: { type: 'Days' } }] }],
+          },
+        ],
         paging: { offset: 0, limit: 40, total: 1 },
       },
     });
     const result = await call(gw, 'list_absence_requests', { statuses: ['Submitted', 'Approved'], employeeId: 7 });
     expect(result.isError, text(result)).toBeUndefined();
-    expect(JSON.stringify(result)).not.toMatch(/influenza|note/);
+    expect(JSON.stringify(result)).not.toMatch(/influenza|note|Sygdom|requestedAccounts|"id":61/);
+    expect(result.structuredContent).toMatchObject({ requests: [{ id: 81, employeeId: 7, status: 'Submitted' }] });
     expect(calls[0]?.query.getAll('status')).toEqual(['Submitted', 'Approved']);
   });
 
