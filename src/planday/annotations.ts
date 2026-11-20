@@ -6,10 +6,11 @@ export const READ_TOOL_ANNOTATIONS = {
 } as const;
 
 /**
- * Write tools that create a draft shift, assign a shift or approve an
- * employee's request for one. None deletes anything; repeating a create
- * makes a duplicate. Deletion is not offered at all: the client has no
- * DELETE.
+ * Write tools: the everyday changes of a shift planner (draft shifts,
+ * assignments, requests, punch clock approval and punch-out, absence). The
+ * only deletion is of a draft shift, which no employee has seen and nobody
+ * has worked, so it is not marked destructive; repeating a create makes a
+ * duplicate.
  */
 export const WRITE_TOOL_ANNOTATIONS = {
   readOnlyHint: false,

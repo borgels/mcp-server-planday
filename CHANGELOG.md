@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.0
+
+The everyday changes of a shift planner (#8), after Planday's OpenAPI
+documents for scheduling, punch clock and absence. Every new write is off
+until writes are enabled, reads its record first where the API allows it,
+and is reported as done only when the answer or a read-back confirms it.
+
+- `update_draft_shift`: change a draft shift. Read first and refused if it
+  is published; sent whole with the changes (`isDraft` true,
+  `allowConflicts` false, break rules on, manual breaks kept, no wage).
+- `delete_draft_shift`: delete a draft shift; read first and refused if it
+  is published. The only DELETE the client sends.
+- `approve_punch_clock`: approve a punched-out shift (`PunchclockFinished`)
+  for payroll; read back as approved.
+- `set_punch_out`: set or correct the punch-out time of a shift's punch
+  clock record; refused when the record is approved or the end is not after
+  the punch-in. No comment or salary note is sent.
+- `register_absence` and `approve_absence_request`: register an employee's
+  absence (Planday's draft submitted on their behalf and approved) and
+  approve a request, notifying nobody, leaving the employee's shifts as they
+  are and making no open shift. No note is sent.
+- `list_absence_accounts` and `list_absence_requests`: the accounts to
+  register on, without salary codes, and the requests, without the
+  employee's note (it can say why they are away).
+
 ## 0.1.0
 
 First version, built from the template (`borgels/mcp-server-template`) with

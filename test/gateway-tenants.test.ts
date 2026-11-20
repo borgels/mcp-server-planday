@@ -194,15 +194,55 @@ const SAMPLE_INPUTS: Record<string, GatewayJsonObject> = {
   create_shift: { departmentId: 1, employeeGroupId: 2, date: '2026-11-20', startTime: '08:00', endTime: '16:00' },
   assign_shift: { shiftId: 31, employeeId: 21 },
   approve_shift_request: { shiftId: 31, employeeId: 21 },
+  list_absence_accounts: { employeeId: 21 },
+  list_absence_requests: { statuses: ['Submitted'] },
+  update_draft_shift: { shiftId: 32, startTime: '09:00' },
+  delete_draft_shift: { shiftId: 32 },
+  approve_punch_clock: { shiftId: 33 },
+  set_punch_out: { shiftId: 33, end: '2026-11-19T16:00' },
+  register_absence: { employeeId: 21, from: '2026-11-23', to: '2026-11-24', absenceType: 'Vacation' },
+  approve_absence_request: { requestId: 41 },
 };
+
+/** Shift 32 is a draft, 33 a punched-out shift; every other shift is assigned to employee 21. */
+const approvedOnce = new Set<string>();
 
 /** Answers that let every tool run to its end: the record asked for, a list of one, a shift with employee 21. */
 async function catalogFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
   const path = new URL(String(input)).pathname;
   const method = init?.method ?? 'GET';
   if (method === 'POST' && path.endsWith('/shifts')) return Response.json({ data: SHIFT_CREATED });
-  if (method === 'POST') return new Response(null, { status: 204 });
+  if (method === 'POST' && path.endsWith('/absencerequests')) return Response.json({ id: 41, status: 'Submitted' });
+  if (method === 'POST' && path.endsWith('/approve') && path.includes('/shifts/33/')) approvedOnce.add('33');
+  if (method === 'POST' || method === 'DELETE') return new Response(null, { status: 204 });
+  if (method === 'PUT' && path.endsWith('/approve')) return new Response(null, { status: 204 });
+  if (method === 'PUT' && path.endsWith('/punchclockshifts')) {
+    return Response.json({ data: [{ startDateTime: '2026-11-19T08:00', endDateTime: '2026-11-19T16:00', departmentId: 1 }] });
+  }
+  if (path.endsWith('/punchclockshifts/byShift/33')) {
+    return Response.json({ data: { id: 51, shiftId: 33, departmentId: 1, employeeId: 21, startDateTime: '2026-11-19T08:00', isApproved: false } });
+  }
+  if (method === 'GET' && path.endsWith('/absencerequests')) {
+    return Response.json({ data: [{ id: 41, employeeId: 21, status: 'Submitted' }], paging: { offset: 0, limit: 40, total: 1 } });
+  }
+  if (path.endsWith('/absencerequests/draft')) {
+    return Response.json({
+      data: {
+        absenceRequest: {
+          absenceType: 'Vacation',
+          absencePeriod: { start: '2026-11-23', end: '2026-11-24' },
+          registrations: [{ date: '2026-11-23', account: { id: 61, costs: [{ value: 7.5, unit: { type: 'Hours' } }] } }],
+        },
+      },
+    });
+  }
   const shiftId = /\/shifts\/(\d+)$/.exec(path)?.[1];
+  if (shiftId === '32' && method === 'PUT') return Response.json({ data: { ...SHIFT_CREATED, id: 32, startTime: '09:00' } });
+  if (shiftId === '32') return Response.json({ data: { ...SHIFT_CREATED, id: 32, status: 'Draft' } });
+  if (shiftId === '33') {
+    const status = approvedOnce.delete('33') ? 'PunchclockApproved' : 'PunchclockFinished';
+    return Response.json({ data: { id: 33, employeeId: 21, status } });
+  }
   if (shiftId) return Response.json({ data: { id: Number(shiftId), employeeId: 21 } });
   if (path.endsWith('/shifts/requests')) return Response.json({ data: [{ shiftId: 31, requesters: [{ employeeId: 21 }] }] });
   const employeeId = /\/employees\/(\d+)$/.exec(path)?.[1];
@@ -267,18 +307,27 @@ describe('tool catalog', () => {
       const fetchImpl = vi.fn(catalogFetch);
       const gw = testGateway({ accessToken: KEY_A, fetchImpl });
       const result = await gw.callTool(entry.name, input!);
-      expect(result.isError, texts(result).join(' ')).toBeUndefined();
+      expect(result.isError, `${entry.name}: ${texts(result).join(' ')}`).toBeUndefined();
 
       const declared = entry.upstream.map(op => ({
         method: op.method,
-        path: op.path.replace(/\{(\w+)\}/g, (_, name: string) => encodeURIComponent(String(input![name] ?? ''))),
+        // A placeholder the input does not hold (an id Planday answers with) stands for any id.
+        path: new RegExp(
+          `^${op.path
+            .split(/\{(\w+)\}/)
+            .map((part, i) => (i % 2 === 0 ? part.replace(/[.*+?^$()|[\]\\]/g, '\\$&') : input![part] === undefined ? '\\d+' : encodeURIComponent(String(input![part]))))
+            .join('')}$`,
+        ),
       }));
       const made = (fetchImpl.mock.calls as unknown as Array<[string, RequestInit]>).map(([url, init]) => ({
         method: init.method,
         path: new URL(url).pathname,
       }));
       for (const request of made) {
-        expect(declared, `${entry.name} made ${request.method} ${request.path}`).toContainEqual(request);
+        expect(
+          declared.some(op => op.method === request.method && op.path.test(request.path)),
+          `${entry.name} made ${request.method} ${request.path}`,
+        ).toBe(true);
       }
     }
   });

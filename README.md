@@ -1,6 +1,6 @@
 # mcp-server-planday
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server for the [Planday Open API](https://openapi.planday.com). It lets an MCP client (Claude or any other MCP-capable assistant) read a Planday portal's departments, employees, schedule and punch clock and, when enabled, create draft shifts, assign shifts and approve shift requests.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for the [Planday Open API](https://openapi.planday.com). It lets an MCP client (Claude or any other MCP-capable assistant) read a Planday portal's departments, employees, schedule and punch clock and, when enabled, create, change and delete draft shifts, assign shifts, approve shift requests and punch clock records, set a forgotten punch-out, and register and approve absence.
 
 > This is an independent, unofficial project. It is not developed, endorsed or supported by Planday.
 
@@ -25,11 +25,19 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for the [Plan
 | `planday_list_positions` | Positions, without revenue fields. |
 | `planday_list_shift_requests` | Shifts employees have asked to take, for the departments given. |
 | `planday_list_punch_clock_records` | Punch clock records between two dates (at most 62 days). |
+| `planday_list_absence_accounts` | One employee's absence accounts (holiday, sickness and so on), without salary codes. |
+| `planday_list_absence_requests` | Absence requests by employee, status or period, without the employee's note. |
 | `planday_create_shift` *(write)* | Create a shift as a draft (`isDraft` true, `allowConflicts` false, the department's break rules, no wage). The answer must be the shift asked for. |
 | `planday_assign_shift` *(write)* | Give a shift to an employee, or make it open; the shift is read back to confirm. |
 | `planday_approve_shift_request` *(write)* | Approve an employee's request for a shift, with no SMS or message; the shift is read back to confirm. |
+| `planday_update_draft_shift` *(write)* | Change a shift that is still a draft (date, times, employee, group, position, shift type, comment). The shift is read first and refused if published; it is sent whole with the changes, as a draft, `allowConflicts` false, no wage, and the answer must show the change. |
+| `planday_delete_draft_shift` *(write)* | Delete a shift that is still a draft; read first, refused if published. |
+| `planday_approve_punch_clock` *(write)* | Approve a worked shift's punch clock record for payroll; the shift must be `PunchclockFinished` and reads back approved. |
+| `planday_set_punch_out` *(write)* | Set or correct the punch-out time of a shift's punch clock record; refused if the record is approved or the end is not after the punch-in. No comment or salary note. |
+| `planday_register_absence` *(write)* | Register an employee's absence on an account or by type: Planday's draft is submitted unchanged on the employee's behalf and approved, with no notification, no change to the employee's shifts and no open shift. No note. |
+| `planday_approve_absence_request` *(write)* | Approve an absence request, with no notification, no change to shifts and no open shift. |
 
-No tool deletes, publishes a schedule, approves punch clock records for payroll, swaps shifts, punches in or out, changes an employee, or reads or sets a wage. The client sends only the three writes above (a fixed list in `src/planday/client.ts`).
+No tool publishes a schedule, changes or deletes a published shift, swaps shifts, punches in, changes the punch-in time (Planday's API cannot), changes an employee or an absence account, declines anything, sends a message, or reads or sets a wage. The only deletion is of a draft shift. The client sends only the writes of the tools above (a fixed list in `src/planday/client.ts`).
 
 ### Personal data
 
@@ -39,7 +47,7 @@ Planday holds an employee's CPR number (`ssn`), bank account and birth date as "
 
 An administrator creates an app in Planday under **Settings > Integrations > API Access**, chooses its scopes and authorizes it. The table then shows the app's **App Id** (the client id) and a **Token** (the refresh token). The server exchanges the refresh token for an access token (`POST https://id.planday.com/connect/token`, valid one hour) and renews it a minute before it expires. Planday documents that refresh tokens do not expire; if a new one ever comes back, it is used from then on (and handed to an embedding host through `onRefreshToken`).
 
-Give the app read access to departments, employees, employee groups, shifts, shift types, positions and punch clock records, and for the writes the right to create and update shifts and approve shift requests; nothing more.
+Give the app read access to departments, employees, employee groups, shifts, shift types, positions, punch clock records and absence, and for the writes the right to create, update and delete shifts, approve shift requests, update punch clock records and create absence; nothing more.
 
 ## Quick start
 
@@ -264,7 +272,7 @@ The first version of a new package is published by hand; see the header of `.git
 
 ## What is not tested against a live portal
 
-The tests use answers shaped as Planday's published OpenAPI documents show them (`https://openapi.planday.com/{hr,scheduling,punchclock}/swagger/v1.0/swagger.json`) and the token flow as the developer guide describes it. No Planday portal was used. Not verified live: the exact field set a portal returns for employees, shifts and punch clock records; that special fields stay out without the parameter; whether the token endpoint ever returns a new refresh token; and the answers of the assign and approve endpoints (documented without a body; the shift is read back instead).
+The tests use answers shaped as Planday's published OpenAPI documents show them (`https://openapi.planday.com/{hr,scheduling,punchclock}/swagger/v1.0/swagger.json`) and the token flow as the developer guide describes it. No Planday portal was used. Not verified live: the exact field set a portal returns for employees, shifts and punch clock records; that special fields stay out without the parameter; whether the token endpoint ever returns a new refresh token; and the answers of the assign and approve endpoints (documented without a body; the shift is read back instead). From 0.2.0 also: whether an update of a draft shift keeps a wage set on it in Planday (none is sent, and the API documents none to send back), the status a shift reads back with after its punch clock record is approved (`PunchclockApproved` or `Approved` is taken as approved), and the absence draft as a portal fills it in.
 
 ## License
 

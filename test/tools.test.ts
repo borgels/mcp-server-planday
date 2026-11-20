@@ -183,7 +183,7 @@ describe('gateway export', () => {
   it('exposes tools without the prefix and with valid JSON Schemas', () => {
     for (const tool of plandayGatewayTools) {
       expect(tool.name.startsWith('planday_')).toBe(false);
-      // Reads are on by default; writes are 'write' (none deletes) and off by default.
+      // Reads are on by default; writes are 'write' (the one deletion is of a draft shift) and off by default.
       expect([tool.riskLevel, tool.enabledByDefault]).toEqual(
         tool.riskLevel === 'read' ? ['read', true] : ['write', false],
       );
@@ -192,6 +192,12 @@ describe('gateway export', () => {
       'create_shift',
       'assign_shift',
       'approve_shift_request',
+      'update_draft_shift',
+      'delete_draft_shift',
+      'approve_punch_clock',
+      'set_punch_out',
+      'register_absence',
+      'approve_absence_request',
     ]);
     const ajv = new Ajv({ strict: true });
     for (const tool of plandayGatewayTools) {

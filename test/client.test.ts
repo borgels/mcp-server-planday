@@ -106,12 +106,20 @@ describe('PlandayClient', () => {
     expect(() => pc({ accessToken: 'k', tokenUrl: 'https://evil.test/connect/token' })).toThrow(/must be on/);
   });
 
-  it('sends only the writes on its fixed list, and never a DELETE', async () => {
+  it('sends only the writes on its fixed list, and no DELETE but of one shift', async () => {
     const fetchImpl = makeFetch(() => jsonResponse({ data: { id: 1 } }, 200));
     const client = makeClient(fetchImpl);
     await expect(client.post('/hr/v1.0/employees', {})).rejects.toThrow('Refused');
     await expect(client.put('/hr/v1.0/employees/1', {})).rejects.toThrow('Refused');
-    await expect(client.put('/scheduling/v1.0/shifts/1', {})).rejects.toThrow('Refused');
+    await expect(client.put('/scheduling/v1.0/shifts/1/employee', {})).rejects.toThrow('Refused');
+    await expect(client.delete('/scheduling/v1.0/shifts')).rejects.toThrow('Refused');
+    await expect(client.delete('/hr/v1.0/employees/1')).rejects.toThrow('Refused');
+    await expect(client.delete('/absence/v1.0/absencerequests/1')).rejects.toThrow('Refused');
+    await expect(client.delete('/scheduling/v1.0/positions/1')).rejects.toThrow('Refused');
+    await expect(client.put('/absence/v1.0/absencerequests/1/decline', {})).rejects.toThrow('Refused');
+    await expect(client.put('/absence/v1.0/accounts/1', {})).rejects.toThrow('Refused');
+    await expect(client.post('/punchclock/v1.0/punchclockshifts', {})).rejects.toThrow('Refused');
+    await expect(client.post('/scheduling/v1.0/shifts/drafts/publish', {})).rejects.toThrow('Refused');
     await expect(client.post('/scheduling/v1.0/shifts/1/requests/2/decline', {})).rejects.toThrow('Refused');
     await expect(client.post('/pay/v1.0/salaries', {})).rejects.toThrow('Refused');
     await expect(client.post('/scheduling/v1.0/shifts/x/employee', {})).rejects.toThrow('Refused');
@@ -119,7 +127,12 @@ describe('PlandayClient', () => {
     await expect(client.post('/scheduling/v1.0/shifts', {})).resolves.toEqual({ data: { id: 1 } });
     await expect(client.post('/scheduling/v1.0/shifts/7/employee', {})).resolves.toEqual({ data: { id: 1 } });
     await expect(client.post('/scheduling/v1.0/shifts/7/requests/9/approve', {})).resolves.toEqual({ data: { id: 1 } });
-    expect('delete' in client).toBe(false);
+    await expect(client.put('/scheduling/v1.0/shifts/7', {})).resolves.toEqual({ data: { id: 1 } });
+    await expect(client.delete('/scheduling/v1.0/shifts/7')).resolves.toEqual({ data: { id: 1 } });
+    await expect(client.post('/scheduling/v1.0/shifts/7/approve')).resolves.toEqual({ data: { id: 1 } });
+    await expect(client.put('/punchclock/v1.0/punchclockshifts', {})).resolves.toEqual({ data: { id: 1 } });
+    await expect(client.post('/absence/v1.0/absencerequests', {})).resolves.toEqual({ data: { id: 1 } });
+    await expect(client.put('/absence/v1.0/absencerequests/5/approve', {})).resolves.toEqual({ data: { id: 1 } });
   });
 
   it('refuses unsafe base URLs without echoing credentials', () => {
