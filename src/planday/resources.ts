@@ -485,7 +485,8 @@ export async function updateDraftShift(
     (updated.employeeId ?? null) !== want.employeeId ||
     updated.employeeGroupId !== want.employeeGroupId ||
     (updated.positionId ?? null) !== want.positionId ||
-    (updated.shiftTypeId ?? null) !== want.shiftTypeId
+    (updated.shiftTypeId ?? null) !== want.shiftTypeId ||
+    (updated.comment ?? null) !== want.comment
   ) {
     throw new UnexpectedAnswerError();
   }
@@ -503,28 +504,60 @@ export async function deleteDraftShift(client: UpstreamClient, input: { shiftId:
   return { deleted: true, shiftId: input.shiftId };
 }
 
+/** A shift's punch clock record, read by the shift (documented "with no date-range filtering"). */
+async function punchClockRecordOf(client: UpstreamClient, shiftId: number): Promise<z.infer<typeof punchClockRecord>> {
+  const current = record(
+    punchClockRecord,
+    await get(client, `/punchclock/v1.0/punchclockshifts/byShift/${encodePathParam(String(shiftId), 'shiftId')}`),
+  );
+  if (current.shiftId !== shiftId) throw new UnexpectedAnswerError();
+  return current;
+}
+
 /**
- * Approve a worked shift's punch clock record. Planday documents it as
- * "Approve a shift that is ready for payroll processing" (POST
- * /scheduling/v1.0/shifts/{shiftId}/approve, 204 without a body). The shift
- * is read first and must be punched out and not yet approved (status
- * PunchclockFinished); afterwards it is read again and must show it
- * approved.
+ * Approve a worked shift's punch clock record on the employee's timesheet,
+ * with Planday's Timesheet API ("Approve Timesheet (Simple)", POST
+ * /timesheet/v1.0/timesheets/approve/simple, 204): the shift is approved for
+ * payroll with the start and end given, by default the punched times. The
+ * scheduling endpoint POST /shifts/{id}/approve is not used: Planday's
+ * release notes say it "does not take punchclock data into account".
+ *
+ * The shift and its punch clock record are read first: the record must be
+ * punched in and out and not approved, and the end must be after the start.
+ * A shift with a punch clock record is a combined shift on the timesheet, so
+ * the record's id is sent as punchClockShiftId, as documented. No note and no
+ * comment is sent. Afterwards the record is read again and must show
+ * isApproved true.
  */
-export async function approvePunchClockShift(client: UpstreamClient, input: { shiftId: number }): Promise<Json> {
-  const path = idPath('/scheduling/v1.0/shifts', input.shiftId, 'shiftId');
-  const before = record(shift, await get(client, path), input.shiftId);
-  if (before.status !== 'PunchclockFinished') {
-    throw new RefusedChangeError(
-      before.status === 'PunchclockApproved'
-        ? 'Refused: the punch clock record of this shift is already approved.'
-        : 'Refused: only a shift that has been punched in and out (status PunchclockFinished) can be approved here.',
-    );
+export async function approvePunchClock(
+  client: UpstreamClient,
+  input: { shiftId: number; start?: string; end?: string },
+): Promise<Json> {
+  const scheduled = record(shift, await get(client, idPath('/scheduling/v1.0/shifts', input.shiftId, 'shiftId')), input.shiftId);
+  const current = await punchClockRecordOf(client, input.shiftId);
+  if (current.isApproved === true) throw new RefusedChangeError('Refused: the punch clock record of this shift is already approved.');
+  const employeeId = current.employeeId ?? scheduled.employeeId;
+  if (!current.startDateTime || !current.endDateTime) {
+    throw new RefusedChangeError('Refused: the employee has not punched both in and out on this shift; set the punch-out first.');
   }
-  nestedFailuresAsStatus(await client.post(`${path}/approve`));
-  const after = record(shift, await get(client, path), input.shiftId);
-  if (after.status !== 'PunchclockApproved' && after.status !== 'Approved') throw new UnexpectedAnswerError();
-  return after;
+  if (!employeeId || (scheduled.employeeId && current.employeeId && scheduled.employeeId !== current.employeeId)) {
+    throw new UnexpectedAnswerError();
+  }
+  const start = input.start ?? current.startDateTime.slice(0, 16);
+  const end = input.end ?? current.endDateTime.slice(0, 16);
+  if (minutes(end) <= minutes(start)) throw new RefusedChangeError('Refused: the end must be after the start.');
+  nestedFailuresAsStatus(
+    await client.post('/timesheet/v1.0/timesheets/approve/simple', {
+      employeeId,
+      shiftId: input.shiftId,
+      punchClockShiftId: current.id,
+      start,
+      end,
+    }),
+  );
+  const after = await punchClockRecordOf(client, input.shiftId);
+  if (after.isApproved !== true) throw new UnexpectedAnswerError();
+  return { approved: true, shiftId: input.shiftId, punchClockRecordId: current.id, employeeId, start, end };
 }
 
 const punchOutAnswer = z.object({
@@ -549,11 +582,8 @@ function minutes(value: string): number {
  * the end asked for.
  */
 export async function setPunchOut(client: UpstreamClient, input: { shiftId: number; end: string }): Promise<Json> {
-  const current = record(
-    punchClockRecord,
-    await get(client, `/punchclock/v1.0/punchclockshifts/byShift/${encodePathParam(String(input.shiftId), 'shiftId')}`),
-  );
-  if (current.shiftId !== input.shiftId || !current.employeeId || !current.startDateTime) throw new UnexpectedAnswerError();
+  const current = await punchClockRecordOf(client, input.shiftId);
+  if (!current.employeeId || !current.startDateTime) throw new UnexpectedAnswerError();
   if (current.isApproved === true) {
     throw new RefusedChangeError('Refused: the punch clock record is approved; it is not changed here.');
   }

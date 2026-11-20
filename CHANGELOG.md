@@ -12,8 +12,12 @@ and is reported as done only when the answer or a read-back confirms it.
   `allowConflicts` false, break rules on, manual breaks kept, no wage).
 - `delete_draft_shift`: delete a draft shift; read first and refused if it
   is published. The only DELETE the client sends.
-- `approve_punch_clock`: approve a punched-out shift (`PunchclockFinished`)
-  for payroll; read back as approved.
+- `approve_punch_clock`: approve a worked shift's punch clock record on the
+  timesheet (Timesheet API, `approve/simple`) with the punched times or
+  corrected start and end; refused when the record is approved or not
+  punched out; the record must read back approved. The scheduling
+  endpoint `shifts/{id}/approve` is not used: Planday says it does not take
+  punch clock data into account.
 - `set_punch_out`: set or correct the punch-out time of a shift's punch
   clock record; refused when the record is approved or the end is not after
   the punch-in. No comment or salary note is sent.

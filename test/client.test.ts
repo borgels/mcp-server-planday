@@ -120,6 +120,10 @@ describe('PlandayClient', () => {
     await expect(client.put('/absence/v1.0/accounts/1', {})).rejects.toThrow('Refused');
     await expect(client.post('/punchclock/v1.0/punchclockshifts', {})).rejects.toThrow('Refused');
     await expect(client.post('/scheduling/v1.0/shifts/drafts/publish', {})).rejects.toThrow('Refused');
+    await expect(client.post('/scheduling/v1.0/shifts/7/approve', {})).rejects.toThrow('Refused');
+    await expect(client.post('/timesheet/v1.0/timesheets/approve', {})).rejects.toThrow('Refused');
+    await expect(client.post('/timesheet/v1.0/timesheets/unapprove', {})).rejects.toThrow('Refused');
+    await expect(client.delete('/timesheet/v1.0/timesheets')).rejects.toThrow('Refused');
     await expect(client.post('/scheduling/v1.0/shifts/1/requests/2/decline', {})).rejects.toThrow('Refused');
     await expect(client.post('/pay/v1.0/salaries', {})).rejects.toThrow('Refused');
     await expect(client.post('/scheduling/v1.0/shifts/x/employee', {})).rejects.toThrow('Refused');
@@ -129,7 +133,7 @@ describe('PlandayClient', () => {
     await expect(client.post('/scheduling/v1.0/shifts/7/requests/9/approve', {})).resolves.toEqual({ data: { id: 1 } });
     await expect(client.put('/scheduling/v1.0/shifts/7', {})).resolves.toEqual({ data: { id: 1 } });
     await expect(client.delete('/scheduling/v1.0/shifts/7')).resolves.toEqual({ data: { id: 1 } });
-    await expect(client.post('/scheduling/v1.0/shifts/7/approve')).resolves.toEqual({ data: { id: 1 } });
+    await expect(client.post('/timesheet/v1.0/timesheets/approve/simple', {})).resolves.toEqual({ data: { id: 1 } });
     await expect(client.put('/punchclock/v1.0/punchclockshifts', {})).resolves.toEqual({ data: { id: 1 } });
     await expect(client.post('/absence/v1.0/absencerequests', {})).resolves.toEqual({ data: { id: 1 } });
     await expect(client.put('/absence/v1.0/absencerequests/5/approve', {})).resolves.toEqual({ data: { id: 1 } });

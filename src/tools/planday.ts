@@ -16,7 +16,7 @@ import {
   ABSENCE_REQUEST_STATUSES,
   ABSENCE_TYPES,
   approveAbsenceRequest,
-  approvePunchClockShift,
+  approvePunchClock,
   deleteDraftShift,
   listAbsenceAccounts,
   listAbsenceRequests,
@@ -48,7 +48,7 @@ import {
   runInCallScope,
   validatePolicyConfig,
 } from '../planday/policy.js';
-import { daysBetween, isIsoDate, isRecordId, isTime, TIME_PATTERN } from '../planday/values.js';
+import { daysBetween, isIsoDate, isLocalDateTime, isRecordId, isTime, TIME_PATTERN } from '../planday/values.js';
 
 type ToolAnnotations = typeof READ_TOOL_ANNOTATIONS | typeof WRITE_TOOL_ANNOTATIONS;
 
@@ -80,6 +80,7 @@ export type PlandayChangeRecord = 'shift' | 'punch_clock' | 'absence';
  *   recordId  a Planday id (a positive integer), in clear
  *   date      a date YYYY-MM-DD, in clear
  *   time      a time HH:MM, in clear
+ *   dateTime  a local date and time YYYY-MM-DDTHH:MM, in clear
  *   count     the number of entries in a list, never the entries
  *   flag      true or false, in clear
  *   kind      one value from a fixed list the tool's schema allows, in clear
@@ -87,7 +88,7 @@ export type PlandayChangeRecord = 'shift' | 'punch_clock' | 'absence';
  *             16 hex characters, or "hmac:" with a key from the host.
  * Names, e-mail addresses, comments and other free text are never log fields.
  */
-export type PlandayLogFieldType = 'recordId' | 'date' | 'time' | 'count' | 'flag' | 'kind' | 'pseudonym';
+export type PlandayLogFieldType = 'recordId' | 'date' | 'time' | 'dateTime' | 'count' | 'flag' | 'kind' | 'pseudonym';
 
 export interface PlandayLogField {
   readonly name: string;
@@ -169,13 +170,7 @@ const change = (
 const recordId = (what: string) => z.number().int().positive().max(Number.MAX_SAFE_INTEGER).describe(what);
 const dateSchema = z.string().trim().refine(isIsoDate, 'must be a date written YYYY-MM-DD');
 const timeSchema = z.string().trim().regex(TIME_PATTERN, 'must be a time written HH:MM');
-const dateTimeSchema = z
-  .string()
-  .trim()
-  .refine(
-    value => /^\d{4}-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d$/.test(value) && isIsoDate(value.slice(0, 10)),
-    'must be a local date and time written YYYY-MM-DDTHH:MM',
-  );
+const dateTimeSchema = z.string().trim().refine(isLocalDateTime, 'must be a local date and time written YYYY-MM-DDTHH:MM');
 /** At most this many days of absence in one registration, both dates included. */
 const MAX_ABSENCE_DAYS = 366;
 const pageShape = (max: number) => ({
@@ -532,22 +527,29 @@ export const PLANDAY_TOOLS: ToolDefinition[] = [
   defineTool({
     name: 'planday_approve_punch_clock',
     title: 'Approve punch clock record (Planday)',
-    description: `Approve the punch clock record of a worked shift, so it is ready for payroll in Planday. The shift is read first and must be punched in and out and not yet approved (status PunchclockFinished); it is read again afterwards to confirm. No wage is set and nothing is paid. ${WRITE_NOTE}`,
-    inputShape: { shiftId: recordId('The worked shift (from list_shifts or list_punch_clock_records).') },
+    description: `Approve the punch clock record of a worked shift on the employee's timesheet, so it is ready for payroll in Planday. By default the punched times are approved; start and end correct them, for example a forgotten or wrong punch-in or punch-out. The shift's record is read first: it must be punched in and out and not yet approved, and the end must be after the start. It is read again afterwards and must show it approved. No note or comment is sent, no wage is set and nothing is paid. ${WRITE_NOTE}`,
+    inputShape: {
+      shiftId: recordId('The worked shift (from list_shifts or list_punch_clock_records).'),
+      start: dateTimeSchema.describe('The start to approve, local date and time YYYY-MM-DDTHH:MM (default: the punch-in).').optional(),
+      end: dateTimeSchema.describe('The end to approve, local date and time YYYY-MM-DDTHH:MM (default: the punch-out).').optional(),
+    },
     annotations: WRITE_TOOL_ANNOTATIONS,
-    returnsUpstreamContent: true,
+    returnsUpstreamContent: false,
     summary: 'Approved punch clock record.',
     upstream: [
       { access: 'read', method: 'GET', path: '/scheduling/v1.0/shifts/{shiftId}' },
-      { access: 'write', method: 'POST', path: '/scheduling/v1.0/shifts/{shiftId}/approve' },
+      { access: 'read', method: 'GET', path: '/punchclock/v1.0/punchclockshifts/byShift/{shiftId}' },
+      { access: 'write', method: 'POST', path: '/timesheet/v1.0/timesheets/approve/simple' },
     ],
-    change: change('approve', 'punch_clock', { shiftId: 'recordId' }),
-    handler: async (client, input) => approvePunchClockShift(client, input),
+    change: change('approve', 'punch_clock', { shiftId: 'recordId', start: 'dateTime', end: 'dateTime' }),
+    check: input =>
+      typeof input.start === 'string' && typeof input.end === 'string' && input.end <= input.start ? 'The end must be after the start.' : undefined,
+    handler: async (client, input) => approvePunchClock(client, input),
   }),
   defineTool({
     name: 'planday_set_punch_out',
     title: 'Set punch-out time (Planday)',
-    description: `Set or correct when an employee punched out of a shift, for example when they forgot to punch out. The shift's punch clock record is read first; an approved record is not changed, and the punch-out must be after the punch-in. The time is the portal's local time. The punch-in time cannot be changed through Planday's API. ${WRITE_NOTE}`,
+    description: `Set or correct when an employee punched out of a shift, for example when they forgot to punch out. The shift's punch clock record is read first; an approved record is not changed, and the punch-out must be after the punch-in. The time is the portal's local time. To correct the punch-in, approve the record with approve_punch_clock and the right start. ${WRITE_NOTE}`,
     inputShape: {
       shiftId: recordId('The shift the punch clock record belongs to.'),
       end: dateTimeSchema.describe('The punch-out, local date and time YYYY-MM-DDTHH:MM.'),
@@ -559,7 +561,7 @@ export const PLANDAY_TOOLS: ToolDefinition[] = [
       { access: 'read', method: 'GET', path: '/punchclock/v1.0/punchclockshifts/byShift/{shiftId}' },
       { access: 'write', method: 'PUT', path: '/punchclock/v1.0/punchclockshifts' },
     ],
-    change: change('punch_out', 'punch_clock', { shiftId: 'recordId' }),
+    change: change('punch_out', 'punch_clock', { shiftId: 'recordId', end: 'dateTime' }),
     handler: async (client, input) => setPunchOut(client, input),
   }),
   defineTool({
@@ -647,6 +649,8 @@ export function logFieldValue(
       return isIsoDate(value) ? value : undefined;
     case 'time':
       return isTime(value) ? value : undefined;
+    case 'dateTime':
+      return isLocalDateTime(value) ? value : undefined;
     case 'count':
       return Array.isArray(value) ? value.length : undefined;
     case 'flag':

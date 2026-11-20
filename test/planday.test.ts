@@ -275,7 +275,7 @@ describe('writes', () => {
       'PUT /absence/v1.0/absencerequests/{requestId}/approve',
       'PUT /punchclock/v1.0/punchclockshifts',
       'DELETE /scheduling/v1.0/shifts/{shiftId}',
-      'POST /scheduling/v1.0/shifts/{shiftId}/approve',
+      'POST /timesheet/v1.0/timesheets/approve/simple',
       'PUT /scheduling/v1.0/shifts/{shiftId}',
     ].sort());
   });

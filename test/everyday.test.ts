@@ -100,7 +100,7 @@ describe('update_draft_shift', () => {
   });
 
   it('reports a failure when the answer is not the shift asked for, or no longer a draft', async () => {
-    for (const answer of [{ ...DRAFT, startTime: '08:00' }, { ...DRAFT, startTime: '09:00', isDraft: false }]) {
+    for (const answer of [{ ...DRAFT, startTime: '08:00' }, { ...DRAFT, startTime: '09:00', isDraft: false }, { ...DRAFT, startTime: '09:00', comment: 'Gammel' }]) {
       const { gw } = planday({
         'GET /scheduling/v1.0/shifts/31': { data: DRAFT },
         'PUT /scheduling/v1.0/shifts/31': { data: answer },
@@ -134,40 +134,64 @@ describe('delete_draft_shift', () => {
   });
 });
 
+const PUNCH = { id: 51, shiftId: 33, departmentId: 1, employeeId: 7, startDateTime: '2026-11-19T08:00', endDateTime: null, isApproved: false };
+const PUNCHED = { ...PUNCH, endDateTime: '2026-11-19T16:02' };
+const WORKED = { data: { id: 33, employeeId: 7, punchClockShiftId: 51, status: 'PunchclockFinished' } };
+
 describe('approve_punch_clock', () => {
-  it('approves a punched-out shift and reads it back as approved', async () => {
+  it('approves the punched times on the timesheet and reads the record back as approved', async () => {
     const { gw, writes } = planday({
-      'GET /scheduling/v1.0/shifts/33': [
-        { turn: { data: { id: 33, employeeId: 7, status: 'PunchclockFinished' } } },
-        { turn: { data: { id: 33, employeeId: 7, status: 'PunchclockApproved' } } },
-      ],
-      'POST /scheduling/v1.0/shifts/33/approve': null,
+      'GET /scheduling/v1.0/shifts/33': WORKED,
+      'GET /punchclock/v1.0/punchclockshifts/byShift/33': [{ turn: { data: PUNCHED } }, { turn: { data: { ...PUNCHED, isApproved: true } } }],
+      'POST /timesheet/v1.0/timesheets/approve/simple': null,
     });
     const result = await call(gw, 'approve_punch_clock', { shiftId: 33 });
     expect(result.isError, text(result)).toBeUndefined();
-    expect(writes().map(c => `${c.method} ${c.path}`)).toEqual(['POST /scheduling/v1.0/shifts/33/approve']);
+    expect(writes().map(c => `${c.method} ${c.path}`)).toEqual(['POST /timesheet/v1.0/timesheets/approve/simple']);
+    // A combined shift: the scheduled shift's id and the punch clock record's id. No note, no comment.
+    expect(writes()[0]?.body).toEqual({ employeeId: 7, shiftId: 33, punchClockShiftId: 51, start: '2026-11-19T08:00', end: '2026-11-19T16:02' });
   });
 
-  it('refuses a shift that is not punched out, or already approved, before anything is sent', async () => {
-    for (const status of ['Assigned', 'PunchclockStarted', 'PunchclockApproved', 'Draft']) {
-      const { gw, writes } = planday({ 'GET /scheduling/v1.0/shifts/33': { data: { id: 33, status } } });
-      const result = await call(gw, 'approve_punch_clock', { shiftId: 33 });
-      expect(result.isError, status).toBe(true);
+  it('approves corrected times when they are given', async () => {
+    const { gw, writes } = planday({
+      'GET /scheduling/v1.0/shifts/33': WORKED,
+      'GET /punchclock/v1.0/punchclockshifts/byShift/33': [{ turn: { data: PUNCHED } }, { turn: { data: { ...PUNCHED, isApproved: true } } }],
+      'POST /timesheet/v1.0/timesheets/approve/simple': null,
+    });
+    const result = await call(gw, 'approve_punch_clock', { shiftId: 33, start: '2026-11-19T07:45', end: '2026-11-19T16:00' });
+    expect(result.isError, text(result)).toBeUndefined();
+    expect(writes()[0]?.body).toMatchObject({ start: '2026-11-19T07:45', end: '2026-11-19T16:00' });
+  });
+
+  it('refuses a record that is approved, not punched out, or would end before it starts, before anything is sent', async () => {
+    for (const [record, input] of [
+      [{ ...PUNCHED, isApproved: true }, {}],
+      [PUNCH, {}],
+      [PUNCHED, { end: '2026-11-19T07:00' }],
+    ] as const) {
+      const { gw, writes } = planday({ 'GET /scheduling/v1.0/shifts/33': WORKED, 'GET /punchclock/v1.0/punchclockshifts/byShift/33': { data: record } });
+      const result = await call(gw, 'approve_punch_clock', { shiftId: 33, ...input });
+      expect(result.isError).toBe(true);
       expect(writes()).toEqual([]);
     }
   });
 
-  it('reports a failure when the shift does not read back as approved', async () => {
+  it('does not report success when the record does not read back as approved, even if the shift says Approved', async () => {
     const { gw } = planday({
-      'GET /scheduling/v1.0/shifts/33': { data: { id: 33, status: 'PunchclockFinished' } },
-      'POST /scheduling/v1.0/shifts/33/approve': null,
+      'GET /scheduling/v1.0/shifts/33': [{ turn: WORKED }, { turn: { data: { ...WORKED.data, status: 'Approved' } } }],
+      'GET /punchclock/v1.0/punchclockshifts/byShift/33': { data: PUNCHED },
+      'POST /timesheet/v1.0/timesheets/approve/simple': null,
     });
     const result = await call(gw, 'approve_punch_clock', { shiftId: 33 });
     expect(result.isError).toBe(true);
+    expect(text(result)).toMatch(/without the expected data/);
+  });
+
+  it('logs the shift and the approved times', () => {
+    const resolved = resolvePlandayChange('approve_punch_clock', { shiftId: 33, start: '2026-11-19T07:45', end: '2026-11-19T16:00' });
+    expect(resolved.ok && resolved.change.values).toEqual({ shiftId: 33, start: '2026-11-19T07:45', end: '2026-11-19T16:00' });
   });
 });
-
-const PUNCH = { id: 51, shiftId: 33, departmentId: 1, employeeId: 7, startDateTime: '2026-11-19T08:00', endDateTime: null, isApproved: false };
 
 describe('set_punch_out', () => {
   it('sets the punch-out on the shift’s record, with no comment and no salary note', async () => {
@@ -200,6 +224,11 @@ describe('set_punch_out', () => {
       expect((await call(gw, 'set_punch_out', { shiftId: 33, end })).isError, end).toBe(true);
     }
     expect(calls).toEqual([]);
+  });
+
+  it('logs the shift and the punch-out', () => {
+    const resolved = resolvePlandayChange('set_punch_out', { shiftId: 33, end: '2026-11-19T16:30' });
+    expect(resolved.ok && resolved.change.values).toEqual({ shiftId: 33, end: '2026-11-19T16:30' });
   });
 
   it('reports a failure when the answer does not show the punch-out asked for', async () => {
@@ -345,6 +374,32 @@ describe('absence reads', () => {
       'GET /absence/v1.0/accounts': { data: [{ id: 61, employeeId: 8, name: 'Sygdom' }], paging: { offset: 0, limit: 50, total: 1 } },
     });
     expect((await call(gw, 'list_absence_accounts', { employeeId: 7 })).isError).toBe(true);
+  });
+});
+
+describe('audit', () => {
+  it('records the ids, dates and times of the new changes, never a comment', async () => {
+    const records: Array<Record<string, unknown>> = [];
+    const { gw } = planday(
+      {
+        'PUT /absence/v1.0/absencerequests/81/approve': null,
+        'GET /absence/v1.0/absencerequests/draft': DRAFT_ABSENCE,
+        'POST /absence/v1.0/absencerequests': { id: 82, status: 'Submitted' },
+        'PUT /absence/v1.0/absencerequests/82/approve': null,
+        'GET /punchclock/v1.0/punchclockshifts/byShift/33': { data: PUNCH },
+        'PUT /punchclock/v1.0/punchclockshifts': { data: [{ startDateTime: '2026-11-19T08:00', endDateTime: '2026-11-19T16:30', departmentId: 1 }] },
+      },
+      { enableWrites: true, audit: (record: Record<string, unknown>) => void records.push({ ...record }) },
+    );
+    await call(gw, 'approve_absence_request', { requestId: 81 });
+    await call(gw, 'register_absence', { employeeId: 7, from: '2026-11-23', to: '2026-11-24', accountId: 61 });
+    await call(gw, 'set_punch_out', { shiftId: 33, end: '2026-11-19T16:30' });
+    const starts = records.filter(r => r.action === 'start').map(r => r.target);
+    expect(starts).toEqual([
+      { requestId: 81 },
+      { employeeId: 7, from: '2026-11-23', to: '2026-11-24', accountId: 61 },
+      { shiftId: 33, end: '2026-11-19T16:30' },
+    ]);
   });
 });
 

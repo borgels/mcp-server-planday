@@ -198,7 +198,7 @@ const SAMPLE_INPUTS: Record<string, GatewayJsonObject> = {
   list_absence_requests: { statuses: ['Submitted'] },
   update_draft_shift: { shiftId: 32, startTime: '09:00' },
   delete_draft_shift: { shiftId: 32 },
-  approve_punch_clock: { shiftId: 33 },
+  approve_punch_clock: { shiftId: 33, end: '2026-11-19T16:15' },
   set_punch_out: { shiftId: 33, end: '2026-11-19T16:00' },
   register_absence: { employeeId: 21, from: '2026-11-23', to: '2026-11-24', absenceType: 'Vacation' },
   approve_absence_request: { requestId: 41 },
@@ -213,14 +213,18 @@ async function catalogFetch(input: string | URL | Request, init?: RequestInit): 
   const method = init?.method ?? 'GET';
   if (method === 'POST' && path.endsWith('/shifts')) return Response.json({ data: SHIFT_CREATED });
   if (method === 'POST' && path.endsWith('/absencerequests')) return Response.json({ id: 41, status: 'Submitted' });
-  if (method === 'POST' && path.endsWith('/approve') && path.includes('/shifts/33/')) approvedOnce.add('33');
+  if (method === 'POST' && path.endsWith('/timesheets/approve/simple')) approvedOnce.add('33');
   if (method === 'POST' || method === 'DELETE') return new Response(null, { status: 204 });
   if (method === 'PUT' && path.endsWith('/approve')) return new Response(null, { status: 204 });
   if (method === 'PUT' && path.endsWith('/punchclockshifts')) {
     return Response.json({ data: [{ startDateTime: '2026-11-19T08:00', endDateTime: '2026-11-19T16:00', departmentId: 1 }] });
   }
   if (path.endsWith('/punchclockshifts/byShift/33')) {
-    return Response.json({ data: { id: 51, shiftId: 33, departmentId: 1, employeeId: 21, startDateTime: '2026-11-19T08:00', isApproved: false } });
+    const isApproved = approvedOnce.has('33');
+    approvedOnce.delete('33');
+    return Response.json({
+      data: { id: 51, shiftId: 33, departmentId: 1, employeeId: 21, startDateTime: '2026-11-19T08:00', endDateTime: '2026-11-19T16:00', isApproved },
+    });
   }
   if (method === 'GET' && path.endsWith('/absencerequests')) {
     return Response.json({ data: [{ id: 41, employeeId: 21, status: 'Submitted' }], paging: { offset: 0, limit: 40, total: 1 } });
@@ -239,10 +243,7 @@ async function catalogFetch(input: string | URL | Request, init?: RequestInit): 
   const shiftId = /\/shifts\/(\d+)$/.exec(path)?.[1];
   if (shiftId === '32' && method === 'PUT') return Response.json({ data: { ...SHIFT_CREATED, id: 32, startTime: '09:00' } });
   if (shiftId === '32') return Response.json({ data: { ...SHIFT_CREATED, id: 32, status: 'Draft' } });
-  if (shiftId === '33') {
-    const status = approvedOnce.delete('33') ? 'PunchclockApproved' : 'PunchclockFinished';
-    return Response.json({ data: { id: 33, employeeId: 21, status } });
-  }
+  if (shiftId === '33') return Response.json({ data: { id: 33, employeeId: 21, punchClockShiftId: 51, status: 'PunchclockFinished' } });
   if (shiftId) return Response.json({ data: { id: Number(shiftId), employeeId: 21 } });
   if (path.endsWith('/shifts/requests')) return Response.json({ data: [{ shiftId: 31, requesters: [{ employeeId: 21 }] }] });
   const employeeId = /\/employees\/(\d+)$/.exec(path)?.[1];

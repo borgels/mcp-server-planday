@@ -90,8 +90,8 @@ export const ALLOWED_WRITES: ReadonlyArray<{ method: 'POST' | 'PUT' | 'DELETE'; 
   // A draft shift: the tools read it first and send these only while it is a draft.
   { method: 'PUT', path: /^\/scheduling\/v1\.0\/shifts\/\d+$/ },
   { method: 'DELETE', path: /^\/scheduling\/v1\.0\/shifts\/\d+$/ },
-  // Approve a punched-out shift for payroll, and set the punch-out time of a record.
-  { method: 'POST', path: /^\/scheduling\/v1\.0\/shifts\/\d+\/approve$/ },
+  // Approve a punched-out shift on the timesheet, and set the punch-out time of a record.
+  { method: 'POST', path: /^\/timesheet\/v1\.0\/timesheets\/approve\/simple$/ },
   { method: 'PUT', path: /^\/punchclock\/v1\.0\/punchclockshifts$/ },
   // Absence: submit a request on an employee's behalf, and approve a request.
   { method: 'POST', path: /^\/absence\/v1\.0\/absencerequests$/ },
