@@ -26,7 +26,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for the [Plan
 | `planday_list_shift_requests` | Shifts employees have asked to take, for the departments given. |
 | `planday_list_punch_clock_records` | Punch clock records between two dates (at most 62 days). |
 | `planday_list_absence_accounts` | One employee's absence accounts (holiday, sickness and so on), without salary codes. |
-| `planday_list_absence_requests` | Absence requests by employee, status or period, without the employee's note. |
+| `planday_list_absence_requests` | Absence requests by employee, status or period: employee, period and status, without the employee's note or the accounts asked for (they say why the employee is away). |
 | `planday_create_shift` *(write)* | Create a shift as a draft (`isDraft` true, `allowConflicts` false, the department's break rules, no wage). The answer must be the shift asked for. |
 | `planday_assign_shift` *(write)* | Give a shift to an employee, or make it open; the shift is read back to confirm. |
 | `planday_approve_shift_request` *(write)* | Approve an employee's request for a shift, with no SMS or message; the shift is read back to confirm. |
