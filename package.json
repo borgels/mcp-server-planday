@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-planday",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "mcpName": "io.github.borgels/mcp-server-planday",
   "description": "Unofficial MCP server for the Planday Open API: departments, employees, schedule and punch clock.",
   "type": "module",
@@ -16,6 +16,7 @@
     "dist",
     "README.md",
     "LICENSE",
+    "NOTICE",
     "CHANGELOG.md",
     ".env.example"
   ],
@@ -41,7 +42,7 @@
     "planday"
   ],
   "author": "",
-  "license": "Apache-2.0",
+  "license": "FSL-1.1-ALv2",
   "engines": {
     "node": ">=22"
   },
