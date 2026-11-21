@@ -1,5 +1,5 @@
 import { z } from 'zod/v4';
-import { nestedFailuresAsStatus } from '../errors.js';
+import { failureMetadata, nestedFailuresAsStatus, PlandayAnswerError } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { QueryValue, UpstreamClient } from './client.js';
 
@@ -718,12 +718,17 @@ export async function approveAbsenceRequest(client: UpstreamClient, input: { req
   return { approved: true, requestId: input.requestId };
 }
 
-/** The request was submitted, but its approval failed: our own text with the request's id, so it can be found. */
-export class AbsenceNotApprovedError extends Error {
-  constructor(requestId: number) {
+/**
+ * The request was submitted, but its approval failed: our own text with the request's id, so it can be found. When
+ * the approval failed on an HTTP answer from Planday, its status and request id are kept as metadata.
+ */
+export class AbsenceNotApprovedError extends PlandayAnswerError {
+  constructor(requestId: number, approvalError?: unknown) {
+    const failure = failureMetadata(approvalError);
     super(
       `The absence was submitted as request ${requestId}, but Planday did not approve it. ` +
         'Approve it with approve_absence_request or in Planday.',
+      failure ? { status: failure.httpStatus, requestId: failure.requestId } : {},
     );
     this.name = 'AbsenceNotApprovedError';
   }
@@ -767,8 +772,8 @@ export async function registerAbsence(
   if (answer.data.status !== 'Approved') {
     try {
       await approveAbsenceRequest(client, { requestId });
-    } catch {
-      throw new AbsenceNotApprovedError(requestId);
+    } catch (error) {
+      throw new AbsenceNotApprovedError(requestId, error);
     }
   }
   return { registered: true, requestId, employeeId: input.employeeId, from: input.from, to: input.to, days: draft.registrations.length };

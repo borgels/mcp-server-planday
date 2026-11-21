@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+
+- Gateway error results carry failure metadata: when Planday answered with
+  an HTTP error (a refused token or redirect, or an approval that failed
+  after an absence was submitted, included), the result has `failure: {
+  httpStatus, requestId? }`, so a host can count failures by status without
+  reading their text. `requestId` is the vendor's own id from a response
+  header (`REQUEST_ID_HEADERS`; Planday documents none, so the common list),
+  kept only when it is a hex id of 8 to 64 characters (one run of hex
+  digits, or groups of four or more joined by single hyphens, as in a UUID)
+  and does not hold the shape of a personal number. It is checked again
+  after redaction, so an id that shared a piece with the refresh token or an
+  access token is dropped. Never the body, the vendor's error code or
+  message. The shared helpers are in `src/errors.ts` (`vendorRequestId`,
+  `requestIdFrom`, `failureMetadata`, and `PlandayAnswerError`, the base of
+  every error caused by an HTTP answer from Planday).
+
 ## 0.2.1
 
 - `list_absence_requests` leaves out the accounts a request is asked on
