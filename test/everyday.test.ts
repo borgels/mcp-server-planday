@@ -316,12 +316,19 @@ describe('register_absence', () => {
     const { gw } = planday({
       'GET /absence/v1.0/absencerequests/draft': DRAFT_ABSENCE,
       'POST /absence/v1.0/absencerequests': { id: 81, status: 'Submitted' },
-      'PUT /absence/v1.0/absencerequests/81/approve': () => Response.json({ title: 'Forbidden', detail: 'Mette er syg' }, { status: 403 }),
+      'PUT /absence/v1.0/absencerequests/81/approve': () =>
+        Response.json(
+          { title: 'Forbidden', detail: 'Mette er syg' },
+          { status: 403, headers: { 'x-request-id': '3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b' } },
+        ),
     });
     const result = await call(gw, 'register_absence', { employeeId: 7, from: '2026-11-23', to: '2026-11-24', absenceType: 'Absence' });
     expect(result.isError).toBe(true);
     expect(text(result)).toContain('request 81');
     expect(text(result)).not.toContain('Mette');
+    // The approval's HTTP answer, as metadata: its status and request id, nothing of its body.
+    expect(result.failure).toEqual({ httpStatus: 403, requestId: '3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b' });
+    expect(JSON.stringify(result)).not.toContain('Mette');
   });
 
   it('logs the employee, the period and the type, never a note', () => {

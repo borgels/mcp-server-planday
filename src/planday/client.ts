@@ -1,5 +1,12 @@
 import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
-import { PlandayHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
+import {
+  PlandayAnswerError,
+  PlandayHttpError,
+  describeUrl,
+  parseRetryAfterMs,
+  requestIdFrom,
+  SecretRedactor,
+} from '../errors.js';
 import { USER_AGENT } from '../version.js';
 
 export interface PlandayClientOptions {
@@ -175,16 +182,19 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
   };
 }
 
-/** The token endpoint refused the refresh token or the client id: our own text, nothing of the answer. */
-export class PlandayTokenError extends Error {
-  readonly status: number;
-  constructor(status: number) {
+/**
+ * The token endpoint refused the refresh token or the client id: our own text, with the status and Planday's request
+ * id as metadata, nothing else of the answer.
+ */
+export class PlandayTokenError extends PlandayAnswerError {
+  declare readonly status: number;
+  constructor(status: number, requestId?: string) {
     super(
       `Planday refused the app's token (HTTP ${status}). The app may have been removed or its access withdrawn; ` +
         'an administrator authorizes it again under Settings > Integrations > API Access and copies the new token.',
+      { status, requestId },
     );
     this.name = 'PlandayTokenError';
-    this.status = status;
   }
 }
 
@@ -319,13 +329,22 @@ export class PlandayClient implements UpstreamClient {
     const answer = await this.execute('POST', this.tokenUrl, init, async response => {
       if (isRedirect(response.status)) {
         await discardBody(response);
-        throw new Error(redirectRefusedMessage(response, 'POST', this.tokenUrl));
+        throw new PlandayAnswerError(redirectRefusedMessage(response, 'POST', this.tokenUrl), {
+          status: response.status,
+          requestId: requestIdFrom(response.headers),
+        });
       }
       if (!response.ok) {
         // The body is Planday's text: never read into an error.
         await discardBody(response);
-        if (response.status === 400 || response.status === 401) throw new PlandayTokenError(response.status);
-        throw new PlandayHttpError({ status: response.status, url: describeUrl(this.tokenUrl), retryAfter: response.headers.get('retry-after') ?? undefined });
+        const requestId = requestIdFrom(response.headers);
+        if (response.status === 400 || response.status === 401) throw new PlandayTokenError(response.status, requestId);
+        throw new PlandayHttpError({
+          status: response.status,
+          url: describeUrl(this.tokenUrl),
+          retryAfter: response.headers.get('retry-after') ?? undefined,
+          requestId,
+        });
       }
       return readResponseBody(response, this.maxResponseBytes);
     });
@@ -396,7 +415,10 @@ export class PlandayClient implements UpstreamClient {
       const result = await this.execute(method, url, init, async response => {
         if (isRedirect(response.status)) {
           await discardBody(response);
-          throw new Error(this.redactor.redact(redirectRefusedMessage(response, method, url)));
+          throw new PlandayAnswerError(this.redactor.redact(redirectRefusedMessage(response, method, url)), {
+            status: response.status,
+            requestId: requestIdFrom(response.headers),
+          });
         }
         if (response.status === 401 && attempt === 1) {
           await discardBody(response);
@@ -409,6 +431,7 @@ export class PlandayClient implements UpstreamClient {
             status: response.status,
             url: describeUrl(url),
             retryAfter: response.headers.get('retry-after') ?? undefined,
+            requestId: requestIdFrom(response.headers),
           });
         }
         return { body: (await readResponseBody(response, this.maxResponseBytes)) as T };
