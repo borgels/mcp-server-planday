@@ -8,6 +8,7 @@ import {
   TOOL_PREFIX,
   type InstancePolicy,
 } from './planday/policy.js';
+import { ActAsRefusedError, actAsRefusalInForm, normaliseActAs, type ActAs, type ActAsRefusal } from './act-as.js';
 import { ConfigError } from './config-env.js';
 import {
   failureMetadata,
@@ -66,6 +67,12 @@ import {
  */
 
 export type { AuditSink, InstancePolicy } from './planday/policy.js';
+export { ACT_AS_REFUSALS, ACT_AS_TEXTS } from './act-as.js';
+
+/** The person a call is made for (GatewayCallContext.actAs; see src/act-as.ts). */
+export type GatewayActAs = ActAs;
+/** Why a call was not made as the person: `invalid` actAs, `no_user` in Planday, or `not_permitted` (not used here). */
+export type GatewayActAsRefusal = ActAsRefusal;
 export type {
   PlandayChangeAction,
   PlandayChangeRecord,
@@ -100,6 +107,12 @@ export interface GatewayToolResult {
   isError?: boolean;
   /** On an error result from Planday only: its HTTP status and request id (see GatewayFailure). */
   failure?: GatewayFailure;
+  /**
+   * On an error result only: the call was not made, because it could not be made for the person in `actAs` (a
+   * self-service tool without a valid person, or with no single active employee with that work e-mail). The text is
+   * fixed and never holds the e-mail.
+   */
+  actAsRefused?: GatewayActAsRefusal;
 }
 
 export type GatewayCallContext = CallContext;
@@ -137,6 +150,12 @@ export interface GatewayToolCatalogEntry {
    * False for every tool here: none moves money.
    */
   readonly requiresConfirmation: boolean;
+  /**
+   * True for a self-service tool: it reads or changes only the person's own
+   * employee, found by the work e-mail in the call context's `actAs`, and its
+   * input never names an employee. Without a usable `actAs` it sends nothing.
+   */
+  readonly self: boolean;
   /**
    * Write tools only: what the change does, for a host that logs a change
    * before it is sent. `logFields` are the input fields that identify it,
@@ -217,6 +236,7 @@ export const plandayToolCatalog: readonly GatewayToolCatalogEntry[] = deepFreeze
     upstream: tool.upstream.map(operation => ({ ...operation })),
     broad: tool.broad === true,
     requiresConfirmation: tool.requiresConfirmation === true,
+    self: tool.self === true,
     ...(tool.change
       ? { change: { ...tool.change, logFields: tool.change.logFields.map(field => ({ ...field })) } }
       : {}),
@@ -418,11 +438,23 @@ function buildGateway(options: PlandayGatewayOptions, clientId: string, refreshT
     /** Tools enabled on this instance (the policy's or PLANDAY_DISABLED_TOOLS' disabled tools are left out). */
     tools: underPolicy(() => plandayGatewayTools.filter(tool => !isToolDisabled(tool.name))),
     callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
+      // The person to act as, checked before anything else: a malformed one refuses the call, so a self-service tool
+      // never runs for anyone but the person the host verified.
+      let actAs: Readonly<ActAs> | undefined;
+      try {
+        actAs = normaliseActAs((context as { actAs?: unknown } | undefined)?.actAs);
+      } catch {
+        return Promise.resolve(actAsRefused('invalid'));
+      }
+      const callContext: GatewayCallContext | undefined =
+        context === undefined && actAs === undefined
+          ? undefined
+          : { caller: context?.caller, requestId: context?.requestId, ...(actAs ? { actAs } : {}) };
       // The whole result, text and data (keys included, numbers by their string form), with this instance's secrets
       // redacted: upstream data can echo the key, and so can an error. Redacted first, as data and depth-limited, and
       // only then copied as JSON, so no key is serialised and no deep value can exhaust the stack.
       return underPolicy(() =>
-        runCall(toolName, input, context).then(
+        runCall(toolName, input, callContext).then(
           // A second pass covers what the first one inserted (the depth placeholder). Then the sink check, as the very
           // last step: a result that holds a piece of the key anywhere, outer fields included, is withheld whole.
           result => {
@@ -464,9 +496,15 @@ function buildGateway(options: PlandayGatewayOptions, clientId: string, refreshT
       const text = tool.returnsUpstreamContent ? `${tool.summary} ${UNTRUSTED_CONTENT_NOTE}` : tool.summary;
       return jsonResult(text, data);
     } catch (error) {
+      if (error instanceof ActAsRefusedError) return actAsRefused(error.refusal);
       return errorResult(formatUnknownError(error, redactor), failureMetadata(error));
     }
   }
+}
+
+/** A call not made for the person: our fixed text and the refusal, nothing else. */
+function actAsRefused(refusal: ActAsRefusal): GatewayToolResult {
+  return { ...errorResult(new ActAsRefusedError(refusal).message), actAsRefused: refusal };
 }
 
 /** One gateway instance, as returned by createPlandayGateway. */
@@ -508,7 +546,10 @@ function errorResult(text: string, failure?: GatewayFailure): GatewayToolResult 
  * still in the form of one (redaction can have changed it). Anything else is dropped, never passed on.
  */
 function withFailureInForm(result: GatewayToolResult): GatewayToolResult {
-  const { failure, ...rest } = result;
+  const { failure, actAsRefused: refusal, ...withoutRefusal } = result;
+  // The refusal stays only on an error result, and only as one of ours.
+  const kept = result.isError ? actAsRefusalInForm(refusal) : undefined;
+  const rest: GatewayToolResult = kept ? { ...withoutRefusal, actAsRefused: kept } : withoutRefusal;
   if (!result.isError || failure === undefined || failure === null || typeof failure !== 'object') return rest;
   const status = failure.httpStatus;
   if (typeof status !== 'number' || !Number.isInteger(status) || status < 100 || status > 599) return rest;

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0
+
+- Gateway: act as the person. The call context takes `actAs: { email, name? }`
+  from a host that has verified the person (`src/act-as.ts`, the same shape as
+  the template's). A malformed `actAs` refuses any call with `actAsRefused:
+  'invalid'` and nothing is sent. The result type has `actAsRefused`
+  (`invalid`, `no_user`, `not_permitted`), kept only on an error result.
+- Three self-service tools, gateway only (not on the MCP server, which has no
+  verified person), bound to the person's own employee: `list_my_shifts`,
+  `list_my_absence_requests` and `request_my_absence`. The employee is the one
+  active employee whose work e-mail is the person's (exact, case-insensitive,
+  every page of `GET /hr/v1.0/employees` with the e-mail as `searchQuery`). No
+  match, several or a deactivated one: `actAsRefused: 'no_user'` and nothing
+  else is sent; without `actAs` a self-service tool is refused with
+  `invalid`. Their input never names an employee, and every row of an answer
+  must be the person's own. `request_my_absence` submits Planday's draft for
+  the person and never approves it; an account given must be one of the
+  person's own. No new write path: it uses the existing
+  `POST /absence/v1.0/absencerequests`.
+- The catalog marks them with `self: true` (false for every other tool), and
+  `request_my_absence` has a change spec (`request`, `absence`; from, to,
+  account id, absence type). The e-mail is only sent to find the employee:
+  never in the audit, a log field or a text of ours.
+- Company-wide tools are unchanged and ignore `actAs`.
+
 ## 0.4.1
 
 - Licensor and copyright holder corrected to Borgels Services ApS in `LICENSE`,

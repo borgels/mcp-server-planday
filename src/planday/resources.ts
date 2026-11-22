@@ -1,5 +1,6 @@
 import { z } from 'zod/v4';
 import { failureMetadata, nestedFailuresAsStatus, PlandayAnswerError } from '../errors.js';
+import { ActAsRefusedError } from '../act-as.js';
 import { encodePathParam } from '../path-params.js';
 import type { QueryValue, UpstreamClient } from './client.js';
 
@@ -735,16 +736,14 @@ export class AbsenceNotApprovedError extends PlandayAnswerError {
 }
 
 /**
- * Register an employee's absence the way Planday documents it for a manager:
- * get a draft for the employee, the period and the account or type (GET
- * .../absencerequests/draft), submit the draft unchanged on their behalf
- * (POST .../absencerequests), and approve it (PUT .../approve, with
- * APPROVAL). No note is sent.
+ * Get Planday's draft for an absence of one employee (GET .../absencerequests/draft, for the period and the account
+ * or type) and submit it unchanged on their behalf (POST .../absencerequests). No note is sent. Returns the request
+ * and the number of days; it does not approve anything.
  */
-export async function registerAbsence(
+async function submitAbsence(
   client: UpstreamClient,
   input: { employeeId: number; from: string; to: string; accountId?: number; absenceType?: string },
-): Promise<Json> {
+): Promise<{ requestId: number; status: string | null | undefined; days: number }> {
   const query: Record<string, QueryValue> = {
     employeeId: input.employeeId,
     startDate: input.from,
@@ -768,13 +767,121 @@ export async function registerAbsence(
   };
   const answer = submitted.safeParse(nestedFailuresAsStatus(await client.post('/absence/v1.0/absencerequests', body)));
   if (!answer.success) throw new UnexpectedAnswerError();
-  const requestId = answer.data.id;
-  if (answer.data.status !== 'Approved') {
+  return { requestId: answer.data.id, status: answer.data.status, days: draft.registrations.length };
+}
+
+/**
+ * Register an employee's absence the way Planday documents it for a manager:
+ * get a draft for the employee, the period and the account or type (GET
+ * .../absencerequests/draft), submit the draft unchanged on their behalf
+ * (POST .../absencerequests), and approve it (PUT .../approve, with
+ * APPROVAL). No note is sent.
+ */
+export async function registerAbsence(
+  client: UpstreamClient,
+  input: { employeeId: number; from: string; to: string; accountId?: number; absenceType?: string },
+): Promise<Json> {
+  const { requestId, status, days } = await submitAbsence(client, input);
+  if (status !== 'Approved') {
     try {
       await approveAbsenceRequest(client, { requestId });
     } catch (error) {
       throw new AbsenceNotApprovedError(requestId, error);
     }
   }
-  return { registered: true, requestId, employeeId: input.employeeId, from: input.from, to: input.to, days: draft.registrations.length };
+  return { registered: true, requestId, employeeId: input.employeeId, from: input.from, to: input.to, days };
+}
+
+// ---------------------------------------------------------------------------
+// The person's own (self-service), bound to the employee found by the host's verified email (src/act-as.ts)
+
+/** The person's own employee, as the self-service tools use it: only the id, never the email. */
+export interface SelfEmployee {
+  readonly employeeId: number;
+}
+
+/** Most pages read to find the person (50 each). */
+const SELF_MAX_PAGES = 20;
+
+/**
+ * The one active employee whose work email is the person's (case-insensitive, exact), read through every page of
+ * GET /hr/v1.0/employees with the email as `searchQuery` (Planday lists only active employees there). The email is
+ * only sent to find them and is not returned. No match, several, a deactivated one or an incomplete read:
+ * ActAsRefusedError('no_user').
+ */
+export async function resolveSelfEmployee(client: UpstreamClient, email: string): Promise<SelfEmployee> {
+  const wanted = email.trim().toLowerCase();
+  if (!wanted) throw new ActAsRefusedError('invalid');
+  const matches = new Set<number>();
+  let offset = 0;
+  let complete = false;
+  for (let page = 0; page < SELF_MAX_PAGES; page += 1) {
+    const { rows, paging: pages } = list(employee, await get(client, '/hr/v1.0/employees', { offset, limit: 50, searchQuery: wanted }));
+    for (const row of rows) {
+      if (typeof row.email === 'string' && row.email.trim().toLowerCase() === wanted && row.isDeactivated !== true) matches.add(row.id);
+    }
+    offset += rows.length;
+    if (rows.length === 0 || !pages || offset >= pages.total) {
+      complete = true;
+      break;
+    }
+  }
+  if (!complete || matches.size !== 1) throw new ActAsRefusedError('no_user');
+  return Object.freeze({ employeeId: [...matches][0] as number });
+}
+
+/** The person's own shifts between two dates (inclusive): asked for their employee, and every row checked to be theirs. */
+export async function listMyShifts(
+  client: UpstreamClient,
+  me: SelfEmployee,
+  input: { from: string; to: string; status?: string; offset?: number; limit?: number },
+): Promise<Json> {
+  const query: Record<string, QueryValue> = {
+    from: input.from,
+    to: input.to,
+    employeeId: me.employeeId,
+    shiftStatus: input.status,
+    ...pageQuery(input, 50),
+  };
+  const { rows, paging: page } = list(shift, await get(client, '/scheduling/v1.0/shifts', query));
+  if (rows.some(row => row.employeeId !== me.employeeId)) throw new UnexpectedAnswerError();
+  return { shifts: rows, paging: page ?? null };
+}
+
+/** The person's own absence requests, without note or account, every row checked to be theirs. */
+export async function listMyAbsenceRequests(
+  client: UpstreamClient,
+  me: SelfEmployee,
+  input: { statuses?: string[]; from?: string; to?: string; offset?: number; limit?: number },
+): Promise<Json> {
+  const query: Record<string, QueryValue> = {
+    employeeId: me.employeeId,
+    status: input.statuses,
+    startDate: input.from,
+    endDate: input.to,
+    Offset: input.offset ?? 0,
+    Limit: input.limit ?? 40,
+  };
+  const { rows, paging: page } = list(absenceRequest, await get(client, '/absence/v1.0/absencerequests', query));
+  if (rows.some(row => row.employeeId !== me.employeeId)) throw new UnexpectedAnswerError();
+  return { requests: rows, paging: page ?? null };
+}
+
+/**
+ * Ask for the person's own absence, as they would in Planday: an account given must be one of their own (read from
+ * GET /absence/v1.0/accounts for their employee), then Planday's draft for them is submitted unchanged. Never
+ * approved here: the request waits for a manager in Planday, unless Planday's own rules approve it.
+ */
+export async function requestMyAbsence(
+  client: UpstreamClient,
+  me: SelfEmployee,
+  input: { from: string; to: string; accountId?: number; absenceType?: string },
+): Promise<Json> {
+  if (input.accountId !== undefined) {
+    const { rows } = list(absenceAccount, await get(client, '/absence/v1.0/accounts', { employeeId: me.employeeId, Offset: 0, Limit: 50 }));
+    const own = rows.some(row => row.id === input.accountId && (row.employeeId ?? me.employeeId) === me.employeeId);
+    if (!own) throw new RefusedChangeError('That absence account is not one of yours. Nothing was sent to Planday.');
+  }
+  const { requestId, status, days } = await submitAbsence(client, { ...input, employeeId: me.employeeId });
+  return { requested: true, requestId, status: status ?? null, from: input.from, to: input.to, days };
 }
