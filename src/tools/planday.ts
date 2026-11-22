@@ -7,6 +7,7 @@ import {
   UNTRUSTED_RESULT_NOTE,
   WRITE_TOOL_ANNOTATIONS,
 } from '../planday/annotations.js';
+import { ActAsRefusedError, type ActAs } from '../act-as.js';
 import { assertAuditLogWritable, auditTarget, newRequestId, writeAuditEvent } from '../planday/audit.js';
 import { readOnlyClient, type UpstreamClient } from '../planday/client.js';
 import { formatUnknownError, redactDeep, type SecretRedactor } from '../errors.js';
@@ -20,7 +21,12 @@ import {
   deleteDraftShift,
   listAbsenceAccounts,
   listAbsenceRequests,
+  listMyAbsenceRequests,
+  listMyShifts,
   registerAbsence,
+  requestMyAbsence,
+  resolveSelfEmployee,
+  type SelfEmployee,
   setPunchOut,
   updateDraftShift,
   approveShiftRequest,
@@ -70,7 +76,16 @@ export interface RedactingClient extends UpstreamClient {
 }
 
 /** What a write tool does. */
-export type PlandayChangeAction = 'create' | 'assign' | 'approve_request' | 'update' | 'delete' | 'approve' | 'punch_out' | 'register';
+export type PlandayChangeAction =
+  | 'create'
+  | 'assign'
+  | 'approve_request'
+  | 'update'
+  | 'delete'
+  | 'approve'
+  | 'punch_out'
+  | 'register'
+  | 'request';
 
 /** The kind of record a write tool touches. */
 export type PlandayChangeRecord = 'shift' | 'punch_clock' | 'absence';
@@ -133,13 +148,18 @@ export interface ToolDefinition<S extends z.ZodRawShape = z.ZodRawShape> {
   change?: PlandayChangeSpec;
   /** True when a person should confirm each call outside the chat. No tool here moves money, so none is. */
   requiresConfirmation?: boolean;
+  /**
+   * True for a self-service tool: it acts only on the person's own employee, found by the host's `actAs` (src/act-as.ts),
+   * and its input never names an employee. Only offered on the gateway, where a host verifies the person.
+   */
+  self?: boolean;
   /** Cross-field checks the schema shape cannot express. Returns a refusal or undefined. */
   check?: (input: Record<string, unknown>) => string | undefined;
   /**
    * Read-only tools (readOnlyHint) receive a client view that refuses
    * non-GET requests, so a mis-annotated tool cannot write.
    */
-  handler: (client: UpstreamClient, input: z.infer<z.ZodObject<S>>) => Promise<unknown>;
+  handler: (client: UpstreamClient, input: z.infer<z.ZodObject<S>>, me: SelfEmployee | undefined) => Promise<unknown>;
 }
 
 function defineTool<S extends z.ZodRawShape>(definition: Omit<ToolDefinition<S>, 'inputSchema'>): ToolDefinition {
@@ -395,6 +415,55 @@ export const PLANDAY_TOOLS: ToolDefinition[] = [
   }),
 
   // -------------------------------------------------------------------------
+  // The person's own (self-service, gateway only): bound to the employee the host's actAs names, never an id from input.
+
+  defineTool({
+    name: 'planday_list_my_shifts',
+    title: 'List my shifts (Planday)',
+    description:
+      'Your own shifts between two dates (inclusive, at most 62 days): date, start and end, department, employee group, position, shift type, status, breaks and the comment. No wages. Only the employee found by your work e-mail.',
+    inputShape: {
+      from: dateSchema.describe('First date, YYYY-MM-DD.'),
+      to: dateSchema.describe('Last date, YYYY-MM-DD.'),
+      status: z.enum(SHIFT_STATUSES.slice(0, 8) as [string, ...string[]]).optional().describe('Only shifts with this status.'),
+      ...pageShape(200),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed your shifts.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/hr/v1.0/employees' },
+      { access: 'read', method: 'GET', path: '/scheduling/v1.0/shifts' },
+    ],
+    self: true,
+    check: period,
+    handler: async (client, input, me) => listMyShifts(client, me as SelfEmployee, input),
+  }),
+  defineTool({
+    name: 'planday_list_my_absence_requests',
+    title: 'List my absence requests (Planday)',
+    description:
+      'Your own absence requests: period and status (Submitted, Declined, Approved, Cancelled), without the note and the accounts. Only the employee found by your work e-mail.',
+    inputShape: {
+      statuses: z.array(z.enum(ABSENCE_REQUEST_STATUSES)).min(1).max(4).optional().describe('Only requests with these statuses.'),
+      from: dateSchema.describe('Only requests ending on this date or later, YYYY-MM-DD.').optional(),
+      to: dateSchema.describe('Only requests starting on this date or earlier, YYYY-MM-DD.').optional(),
+      ...pageShape(50),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed your absence requests.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/hr/v1.0/employees' },
+      { access: 'read', method: 'GET', path: '/absence/v1.0/absencerequests' },
+    ],
+    self: true,
+    check: input =>
+      typeof input.from === 'string' && typeof input.to === 'string' && daysBetween(input.from, input.to) < 0 ? 'to is before from.' : undefined,
+    handler: async (client, input, me) => listMyAbsenceRequests(client, me as SelfEmployee, input),
+  }),
+
+  // -------------------------------------------------------------------------
   // Writes. No tool publishes the schedule, changes or deletes a published shift, swaps, punches in, changes an
   // employee or an absence account, sets or reads a wage, or notifies anyone. The only deletion is of a draft shift.
 
@@ -605,6 +674,30 @@ export const PLANDAY_TOOLS: ToolDefinition[] = [
     change: change('approve', 'absence', { requestId: 'recordId' }),
     handler: async (client, input) => approveAbsenceRequest(client, input),
   }),
+  defineTool({
+    name: 'planday_request_my_absence',
+    title: 'Request my absence (Planday)',
+    description: `Ask for your own absence from one date to another (both included), on one of your absence accounts (accountId) or by type (absenceType), as you would in Planday: the request is submitted for the employee found by your work e-mail and waits for a manager, unless Planday's own rules approve it. It is never approved here. No note is sent. ${WRITE_NOTE}`,
+    inputShape: {
+      from: dateSchema.describe('First day of absence, YYYY-MM-DD.'),
+      to: dateSchema.describe('Last day of absence, YYYY-MM-DD.'),
+      accountId: recordId('One of your absence accounts.').optional(),
+      absenceType: z.enum(ABSENCE_TYPES).optional().describe('The type of absence, when no account is given.'),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Requested your absence.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/hr/v1.0/employees' },
+      { access: 'read', method: 'GET', path: '/absence/v1.0/accounts' },
+      { access: 'read', method: 'GET', path: '/absence/v1.0/absencerequests/draft' },
+      { access: 'write', method: 'POST', path: '/absence/v1.0/absencerequests' },
+    ],
+    change: change('request', 'absence', { from: 'date', to: 'date', accountId: 'recordId', absenceType: 'kind' }),
+    self: true,
+    check: absencePeriod,
+    handler: async (client, input, me) => requestMyAbsence(client, me as SelfEmployee, input),
+  }),
 ];
 
 /**
@@ -687,7 +780,8 @@ export function enabledTools(): ToolDefinition[] {
 
 export function registerTools(server: McpServer, client: RedactingClient): void {
   validateToolConfig();
-  for (const tool of enabledTools()) {
+  // Self-service tools need a host that verifies the person (the gateway's actAs); the MCP server has none.
+  for (const tool of enabledTools().filter(entry => entry.self !== true)) {
     server.registerTool(
       tool.name,
       {
@@ -721,6 +815,11 @@ export interface CallContext {
   caller?: string;
   /** Request id to reuse in audit events, for correlation with the host's own log. */
   requestId?: string;
+  /**
+   * The person a self-service tool acts for (src/act-as.ts), already checked by the gateway. Only used to find their
+   * employee; never written to the audit.
+   */
+  actAs?: Readonly<ActAs>;
 }
 
 function contextString(value: unknown, max: number): string | undefined {
@@ -783,8 +882,15 @@ export async function executeTool(
   const startedAt = performance.now();
 
   try {
+    // A self-service tool first finds the person's own employee (a read); without a person nothing is sent.
+    let me: SelfEmployee | undefined;
+    if (tool.self === true) {
+      const email = context?.actAs?.email;
+      if (typeof email !== 'string' || email === '') throw new ActAsRefusedError('invalid');
+      me = await resolveSelfEmployee(readOnlyClient(client, tool.name), email);
+    }
     const handlerClient = tool.annotations.readOnlyHint ? readOnlyClient(client, tool.name) : client;
-    const result = await tool.handler(handlerClient, input as never);
+    const result = await tool.handler(handlerClient, input as never, me);
     await writeAuditEvent({
       requestId,
       tool: tool.name,

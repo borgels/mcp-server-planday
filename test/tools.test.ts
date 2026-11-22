@@ -33,7 +33,8 @@ describe('MCP tool surface', () => {
   it('registers every tool with matching annotations', async () => {
     const { mcpClient } = await connect();
     const { tools } = await mcpClient.listTools();
-    expect(tools.map(t => t.name).sort()).toEqual(PLANDAY_TOOLS.map(t => t.name).sort());
+    // Self-service tools need the gateway's actAs and are not on the MCP server.
+    expect(tools.map(t => t.name).sort()).toEqual(PLANDAY_TOOLS.filter(t => t.self !== true).map(t => t.name).sort());
     for (const tool of tools) {
       const definition = PLANDAY_TOOLS.find(t => t.name === tool.name);
       expect(tool.annotations).toEqual(definition?.annotations);
@@ -125,7 +126,7 @@ describe('MCP tool surface', () => {
     const { tools } = await mcpClient.listTools();
     expect(tools.map(t => t.name)).not.toContain('planday_create_shift');
     expect(tools.map(t => t.name)).not.toContain('planday_get_employee');
-    expect(tools).toHaveLength(PLANDAY_TOOLS.length - 2);
+    expect(tools).toHaveLength(PLANDAY_TOOLS.filter(t => t.self !== true).length - 2);
 
     process.env.PLANDAY_DISABLED_TOOLS = 'no_such_tool';
     expect(() => createServer({ clientOptions: { clientId: 'c', refreshToken: 'k' } })).toThrow('PLANDAY_DISABLED_TOOLS');
@@ -198,6 +199,7 @@ describe('gateway export', () => {
       'set_punch_out',
       'register_absence',
       'approve_absence_request',
+      'request_my_absence',
     ]);
     const ajv = new Ajv({ strict: true });
     for (const tool of plandayGatewayTools) {

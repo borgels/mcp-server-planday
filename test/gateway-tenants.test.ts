@@ -202,15 +202,31 @@ const SAMPLE_INPUTS: Record<string, GatewayJsonObject> = {
   set_punch_out: { shiftId: 33, end: '2026-11-19T16:00' },
   register_absence: { employeeId: 21, from: '2026-11-23', to: '2026-11-24', absenceType: 'Vacation' },
   approve_absence_request: { requestId: 41 },
+  list_my_shifts: { from: '2026-11-01', to: '2026-11-30' },
+  list_my_absence_requests: { statuses: ['Submitted'] },
+  request_my_absence: { from: '2026-11-23', to: '2026-11-24', absenceType: 'Vacation' },
 };
+
+/** The person the self-service tools act for in the catalog test: employee 21 has this work e-mail. */
+const SELF_EMAIL = 'me@example.com';
 
 /** Shift 32 is a draft, 33 a punched-out shift; every other shift is assigned to employee 21. */
 const approvedOnce = new Set<string>();
 
 /** Answers that let every tool run to its end: the record asked for, a list of one, a shift with employee 21. */
 async function catalogFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
-  const path = new URL(String(input)).pathname;
+  const url = new URL(String(input));
+  const path = url.pathname;
   const method = init?.method ?? 'GET';
+  if (method === 'GET' && path === '/hr/v1.0/employees' && url.searchParams.has('searchQuery')) {
+    return Response.json({ data: [{ id: 21, email: SELF_EMAIL }], paging: { offset: 0, limit: 50, total: 1 } });
+  }
+  if (method === 'GET' && path === '/scheduling/v1.0/shifts' && url.searchParams.get('employeeId') === '21') {
+    return Response.json({ data: [{ id: 31, employeeId: 21 }], paging: { offset: 0, limit: 50, total: 1 } });
+  }
+  if (method === 'GET' && path === '/absence/v1.0/accounts' && url.searchParams.get('employeeId') === '21') {
+    return Response.json({ data: [{ id: 61, employeeId: 21 }], paging: { offset: 0, limit: 50, total: 1 } });
+  }
   if (method === 'POST' && path.endsWith('/shifts')) return Response.json({ data: SHIFT_CREATED });
   if (method === 'POST' && path.endsWith('/absencerequests')) return Response.json({ id: 41, status: 'Submitted' });
   if (method === 'POST' && path.endsWith('/timesheets/approve/simple')) approvedOnce.add('33');
@@ -255,8 +271,9 @@ describe('tool catalog', () => {
   it('lists every registered tool, matching the gateway definitions', async () => {
     expect(plandayToolCatalog.map(entry => entry.name)).toEqual(plandayGatewayTools.map(tool => tool.name));
     for (const entry of plandayToolCatalog) {
-      const { upstream, broad, requiresConfirmation, change, ...definition } = entry;
+      const { upstream, broad, requiresConfirmation, change, self, ...definition } = entry;
       expect(typeof requiresConfirmation).toBe('boolean');
+      expect(self).toBe(entry.name.includes('_my_'));
       expect(change === undefined).toBe(entry.riskLevel === 'read');
       if (requiresConfirmation) expect(entry.riskLevel).toBe('write');
       expect(typeof broad).toBe('boolean');
@@ -273,8 +290,9 @@ describe('tool catalog', () => {
 
     const { mcpClient } = await connect();
     const { tools } = await mcpClient.listTools();
+    // The self-service tools need the gateway's actAs and are not on the MCP server.
     expect(tools.map(tool => tool.name).sort()).toEqual(
-      plandayToolCatalog.map(entry => `planday_${entry.name}`).sort(),
+      plandayToolCatalog.filter(entry => !entry.self).map(entry => `planday_${entry.name}`).sort(),
     );
     for (const tool of tools) {
       const entry = plandayToolCatalog.find(e => `planday_${e.name}` === tool.name)!;
@@ -307,7 +325,7 @@ describe('tool catalog', () => {
       expect(input, `sample input for ${entry.name}`).toBeDefined();
       const fetchImpl = vi.fn(catalogFetch);
       const gw = testGateway({ accessToken: KEY_A, fetchImpl });
-      const result = await gw.callTool(entry.name, input!);
+      const result = await gw.callTool(entry.name, input!, entry.self ? { actAs: { email: SELF_EMAIL } } : undefined);
       expect(result.isError, `${entry.name}: ${texts(result).join(' ')}`).toBeUndefined();
 
       const declared = entry.upstream.map(op => ({

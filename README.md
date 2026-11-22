@@ -37,6 +37,14 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for the [Plan
 | `planday_register_absence` *(write)* | Register an employee's absence on an account or by type: Planday's draft is submitted unchanged on the employee's behalf and approved, with no notification, no change to the employee's shifts and no open shift. No note. |
 | `planday_approve_absence_request` *(write)* | Approve an absence request, with no notification, no change to shifts and no open shift. |
 
+On the gateway only, three self-service tools act for the person a host verified (`actAs`, see [Acting as the person](#acting-as-the-person)) and never take an employee id:
+
+| Tool | Purpose |
+|---|---|
+| `list_my_shifts` | The person's own shifts between two dates (at most 62 days). |
+| `list_my_absence_requests` | The person's own absence requests, without note or accounts. |
+| `request_my_absence` *(write)* | Ask for the person's own absence on one of their accounts or by type: Planday's draft is submitted for them and waits for a manager. Never approved here. |
+
 No tool publishes a schedule, changes or deletes a published shift, swaps shifts, punches in, changes an employee or an absence account, declines anything, sends a message, or reads or sets a wage. The only deletion is of a draft shift. The client sends only the writes of the tools above (a fixed list in `src/planday/client.ts`).
 
 ### Personal data
@@ -172,7 +180,17 @@ const result = await gateway.callTool('list_shifts', { from: '2026-11-01', to: '
 - **Result format.** A successful `callTool` result has `structuredContent` and one text block: a short summary, a blank line, and the same data as compact JSON, as the MCP specification recommends (many clients read only the text). The JSON is built from the redacted result, so it holds exactly `structuredContent`. An error result has only its text, and, when Planday answered with an HTTP error (a refused token or redirect, or an approval that failed after an absence was submitted, included), `failure: { httpStatus, requestId? }`: the status, and Planday's request id from a response header (`REQUEST_ID_HEADERS` in `src/errors.ts`) only when it is a hex id of 8 to 64 characters (one run of hex digits, or groups of four or more joined by single hyphens, as in a UUID) and does not hold the shape of a personal number. A host can count failures from it without reading their text. Never the response body, Planday's error code or message.
 - **Change resolution.** `resolvePlandayChange(tool, input, { pseudonymKey })` (or `gateway.resolveChange`) validates the input exactly as the call would, the tool's own checks included, and returns what a write call will change before it is sent, for a host that logs the change first: shift, department, employee, group, position and shift type ids, the date and the times; never the comment.
 - **Call context in the audit.** The `caller` and the `requestId` a host passes are never logged in clear: any text can hold a name, a phone number or an address, so both become pseudonyms (HMAC-SHA-256 with `policy.pseudonymKey`, else SHA-256), which still tie the lines of one call together for a host that knows the key. Without a request id the audit makes its own.
-- **Tool catalog.** `plandayToolCatalog` is a frozen list of every tool: `name` (without the `planday_` prefix), `title`, `description`, `riskLevel` (`read`, `write` or `destructive`), `enabledByDefault`, `inputSchema` (JSON Schema), `broad` (true when a tool can read more than its name says, so a host gives it only to roles that may read everything) and `upstream`, the API requests the tool may make (`access`, `method` and path template). It is generated from the same tool table as the MCP server, so it cannot drift from the registered tools. `plandayGatewayTools` holds the same definitions without `upstream` and `broad`; `gateway.tools` lists those enabled on the instance.
+- **Tool catalog.** `plandayToolCatalog` is a frozen list of every tool: `name` (without the `planday_` prefix), `title`, `description`, `riskLevel` (`read`, `write` or `destructive`), `enabledByDefault`, `inputSchema` (JSON Schema), `self` (true for a self-service tool that acts only for the person in `actAs`), `broad` (true when a tool can read more than its name says, so a host gives it only to roles that may read everything) and `upstream`, the API requests the tool may make (`access`, `method` and path template). It is generated from the same tool table as the MCP server, so it cannot drift from the registered tools. `plandayGatewayTools` holds the same definitions without `upstream` and `broad`; `gateway.tools` lists those enabled on the instance.
+
+### Acting as the person
+
+A host that has verified a person (signed in, e-mail confirmed) passes `actAs: { email, name? }` in the call context. Only the self-service tools use it (`self: true` in the catalog):
+
+- The person's employee is the one active employee whose work e-mail is `actAs.email`, compared exactly and case-insensitively, after reading every page of `GET /hr/v1.0/employees` with the e-mail as `searchQuery`. No match, several matches or a deactivated one: the result is an error with `actAsRefused: 'no_user'` and a fixed text, and nothing else is sent.
+- A self-service tool without `actAs` is refused with `actAsRefused: 'invalid'`; a malformed `actAs` refuses any call the same way. A self-service tool is never run as anyone else, and its input never names an employee.
+- The shifts and absence requests are asked for the person's employee, and an answer with a row of anyone else is refused whole. `request_my_absence` submits the draft for the person and never approves it. The request carries no employee, its accounts do: every account in the draft, and an account given, must be one of the person's own (every page of `GET /absence/v1.0/accounts` for their employee), or nothing is sent.
+- The e-mail is only sent to Planday to find the employee. It is never in the audit (which has the host's `caller`, as a pseudonym), a change's log fields or a text of ours.
+- Company-wide tools ignore `actAs` and run as before with the app's own access.
 
 ## Threat model
 

@@ -271,6 +271,7 @@ describe('writes', () => {
       'POST /scheduling/v1.0/shifts/{shiftId}/employee',
       'POST /scheduling/v1.0/shifts/{shiftId}/requests/{employeeId}/approve',
       'POST /absence/v1.0/absencerequests',
+      'POST /absence/v1.0/absencerequests',
       'PUT /absence/v1.0/absencerequests/{requestId}/approve',
       'PUT /absence/v1.0/absencerequests/{requestId}/approve',
       'PUT /punchclock/v1.0/punchclockshifts',
