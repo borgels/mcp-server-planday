@@ -743,6 +743,7 @@ export class AbsenceNotApprovedError extends PlandayAnswerError {
 async function submitAbsence(
   client: UpstreamClient,
   input: { employeeId: number; from: string; to: string; accountId?: number; absenceType?: string },
+  ownAccounts?: ReadonlySet<number>,
 ): Promise<{ requestId: number; status: string | null | undefined; days: number }> {
   const query: Record<string, QueryValue> = {
     employeeId: input.employeeId,
@@ -759,6 +760,11 @@ async function submitAbsence(
   }
   if (input.accountId !== undefined && draft.registrations.some(entry => entry.account?.id !== input.accountId)) {
     throw new UnexpectedAnswerError();
+  }
+  // For the person's own request: the request carries no employee, the accounts do. Every account in the draft must
+  // be one of theirs, or nothing is sent.
+  if (ownAccounts && draft.registrations.some(entry => typeof entry.account?.id !== 'number' || !ownAccounts.has(entry.account.id))) {
+    throw new RefusedChangeError(NOT_OWN_ACCOUNT);
   }
   const body = {
     ...(draft.absenceType ? { absenceType: draft.absenceType } : {}),
@@ -800,8 +806,33 @@ export interface SelfEmployee {
   readonly employeeId: number;
 }
 
-/** Most pages read to find the person (50 each). */
+/** Most pages read to find the person, or their absence accounts (50 each). */
 const SELF_MAX_PAGES = 20;
+
+const NOT_OWN_ACCOUNT = 'Refused: that absence account is not one of yours. Nothing was sent to Planday.';
+
+/**
+ * The ids of the person's own absence accounts, every page of GET /absence/v1.0/accounts for their employee. An account
+ * of anyone else in the answer, or an incomplete read, refuses: nothing is sent on a guess.
+ */
+async function ownAccountIds(client: UpstreamClient, me: SelfEmployee): Promise<Set<number>> {
+  const own = new Set<number>();
+  let offset = 0;
+  for (let page = 0; page < SELF_MAX_PAGES; page += 1) {
+    const { rows, paging: pages } = list(
+      absenceAccount,
+      await get(client, '/absence/v1.0/accounts', { employeeId: me.employeeId, Offset: offset, Limit: 50 }),
+    );
+    for (const row of rows) {
+      // A row without an employee is one of the employee asked for, as in listAbsenceAccounts; another one refuses.
+      if ((row.employeeId ?? me.employeeId) !== me.employeeId) throw new UnexpectedAnswerError();
+      own.add(row.id);
+    }
+    offset += rows.length;
+    if (rows.length === 0 || !pages || offset >= pages.total) return own;
+  }
+  throw new UnexpectedAnswerError();
+}
 
 /**
  * The one active employee whose work email is the person's (case-insensitive, exact), read through every page of
@@ -877,11 +908,8 @@ export async function requestMyAbsence(
   me: SelfEmployee,
   input: { from: string; to: string; accountId?: number; absenceType?: string },
 ): Promise<Json> {
-  if (input.accountId !== undefined) {
-    const { rows } = list(absenceAccount, await get(client, '/absence/v1.0/accounts', { employeeId: me.employeeId, Offset: 0, Limit: 50 }));
-    const own = rows.some(row => row.id === input.accountId && (row.employeeId ?? me.employeeId) === me.employeeId);
-    if (!own) throw new RefusedChangeError('That absence account is not one of yours. Nothing was sent to Planday.');
-  }
-  const { requestId, status, days } = await submitAbsence(client, { ...input, employeeId: me.employeeId });
+  const own = await ownAccountIds(client, me);
+  if (input.accountId !== undefined && !own.has(input.accountId)) throw new RefusedChangeError(NOT_OWN_ACCOUNT);
+  const { requestId, status, days } = await submitAbsence(client, { ...input, employeeId: me.employeeId }, own);
   return { requested: true, requestId, status: status ?? null, from: input.from, to: input.to, days };
 }

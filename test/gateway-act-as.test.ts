@@ -32,6 +32,15 @@ const DRAFT: Route = url =>
       })
     : undefined;
 
+/** The person's own accounts: 61 (on the first page) and 63 (on the second). */
+const ACCOUNTS: Route = url =>
+  url.pathname === '/absence/v1.0/accounts' && url.searchParams.get('employeeId') === String(MY_ID)
+    ? Response.json({
+        data: url.searchParams.get('Offset') === '0' ? [{ id: 61, employeeId: MY_ID }] : [{ id: 63, employeeId: MY_ID }],
+        paging: { offset: Number(url.searchParams.get('Offset')), limit: 1, total: 2 },
+      })
+    : undefined;
+
 function setup(routes: Route[], policy: Record<string, unknown> = {}) {
   const records: Array<Record<string, unknown>> = [];
   const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -223,35 +232,73 @@ describe('only the own employee', () => {
 
 describe('request_my_absence', () => {
   it('submits the draft for the own employee and never approves it', async () => {
-    const { gw, requests, records } = setup([employees([{ id: MY_ID, email: 'mette@example.com' }]), DRAFT]);
+    const { gw, requests, records } = setup([employees([{ id: MY_ID, email: 'mette@example.com' }]), ACCOUNTS, DRAFT]);
     const result = await gw.callTool('request_my_absence', { from: '2026-11-23', to: '2026-11-24', absenceType: 'Vacation' }, { actAs: { email: ME } });
     expect(result.isError).toBeUndefined();
     expect(result.structuredContent).toMatchObject({ requested: true, requestId: 41, status: 'Submitted' });
     const made = requests();
     const draft = made.find(r => r.url.pathname.endsWith('/draft'))!;
     expect(draft.url.searchParams.get('employeeId')).toBe(String(MY_ID));
-    expect(made.map(r => r.method)).toEqual(['GET', 'GET', 'POST']);
+    expect(made.map(r => r.method)).toEqual(['GET', 'GET', 'GET', 'GET', 'POST']);
     expect(made.some(r => r.method === 'PUT')).toBe(false);
     expect(JSON.stringify(records).toLowerCase()).not.toContain('mette@');
   });
 
-  it('takes only one of the person’s own absence accounts', async () => {
-    const accounts: Route = url =>
-      url.pathname === '/absence/v1.0/accounts'
-        ? Response.json({ data: [{ id: 61, employeeId: MY_ID }], paging: { offset: 0, limit: 50, total: 1 } })
+  it('sends nothing when the draft for a type holds an account that is not the person’s', async () => {
+    const foreign: Route = url =>
+      url.pathname === '/absence/v1.0/absencerequests/draft'
+        ? Response.json({
+            data: {
+              absenceRequest: {
+                absenceType: 'Vacation',
+                absencePeriod: { start: '2026-11-23', end: '2026-11-24' },
+                registrations: [{ date: '2026-11-23', account: { id: 61 } }, { date: '2026-11-24', account: { id: 99 } }],
+              },
+            },
+          })
         : undefined;
-    const { gw, requests } = setup([employees([{ id: MY_ID, email: 'mette@example.com' }]), accounts, DRAFT]);
+    const { gw, requests } = setup([employees([{ id: MY_ID, email: 'mette@example.com' }]), ACCOUNTS, foreign]);
+    const result = await gw.callTool('request_my_absence', { from: '2026-11-23', to: '2026-11-24', absenceType: 'Vacation' }, { actAs: { email: ME } });
+    expect(result.isError).toBe(true);
+    expect(requests().filter(r => r.method !== 'GET')).toEqual([]);
+  });
+
+  it('refuses an account list that holds a colleague’s account', async () => {
+    const mixed: Route = url =>
+      url.pathname === '/absence/v1.0/accounts'
+        ? Response.json({ data: [{ id: 61, employeeId: MY_ID }, { id: 62, employeeId: 99 }], paging: { offset: 0, limit: 50, total: 2 } })
+        : undefined;
+    const { gw, requests } = setup([employees([{ id: MY_ID, email: 'mette@example.com' }]), mixed, DRAFT]);
+    const result = await gw.callTool('request_my_absence', { from: '2026-11-23', to: '2026-11-24', absenceType: 'Vacation' }, { actAs: { email: ME } });
+    expect(result.isError).toBe(true);
+    expect(requests().filter(r => r.method !== 'GET')).toEqual([]);
+  });
+
+  it('takes only one of the person’s own absence accounts, from any page', async () => {
+    const draftFor = (id: number): Route => url =>
+      url.pathname === '/absence/v1.0/absencerequests/draft'
+        ? Response.json({
+            data: {
+              absenceRequest: {
+                absencePeriod: { start: '2026-11-23', end: '2026-11-24' },
+                registrations: [{ date: '2026-11-23', account: { id } }],
+              },
+            },
+          })
+        : undefined;
+    const { gw, requests } = setup([employees([{ id: MY_ID, email: 'mette@example.com' }]), ACCOUNTS, draftFor(63)]);
     const other = await gw.callTool('request_my_absence', { from: '2026-11-23', to: '2026-11-24', accountId: 62 }, { actAs: { email: ME } });
     expect(other.isError).toBe(true);
     expect(requests().some(r => r.method === 'POST')).toBe(false);
     expect(requests().find(r => r.url.pathname === '/absence/v1.0/accounts')!.url.searchParams.get('employeeId')).toBe(String(MY_ID));
 
-    const own = await gw.callTool('request_my_absence', { from: '2026-11-23', to: '2026-11-24', accountId: 61 }, { actAs: { email: ME } });
-    expect(own.isError).toBeUndefined();
+    // 63 is on the second page of the person's accounts.
+    const own = await gw.callTool('request_my_absence', { from: '2026-11-23', to: '2026-11-24', accountId: 63 }, { actAs: { email: ME } });
+    expect(own.isError, texts(own).join(' ')).toBeUndefined();
   });
 
   it('is refused like any write when writes are off', async () => {
-    const { gw, fetchImpl } = setup([employees([{ id: MY_ID, email: 'mette@example.com' }]), DRAFT], { enableWrites: false });
+    const { gw, fetchImpl } = setup([employees([{ id: MY_ID, email: 'mette@example.com' }]), ACCOUNTS, DRAFT], { enableWrites: false });
     const result = await gw.callTool('request_my_absence', { from: '2026-11-23', to: '2026-11-24', absenceType: 'Vacation' }, { actAs: { email: ME } });
     expect(result.isError).toBe(true);
     expect(fetchImpl.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'POST')).toBe(false);

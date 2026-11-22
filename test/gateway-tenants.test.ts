@@ -224,6 +224,9 @@ async function catalogFetch(input: string | URL | Request, init?: RequestInit): 
   if (method === 'GET' && path === '/scheduling/v1.0/shifts' && url.searchParams.get('employeeId') === '21') {
     return Response.json({ data: [{ id: 31, employeeId: 21 }], paging: { offset: 0, limit: 50, total: 1 } });
   }
+  if (method === 'GET' && path === '/absence/v1.0/accounts' && url.searchParams.get('employeeId') === '21') {
+    return Response.json({ data: [{ id: 61, employeeId: 21 }], paging: { offset: 0, limit: 50, total: 1 } });
+  }
   if (method === 'POST' && path.endsWith('/shifts')) return Response.json({ data: SHIFT_CREATED });
   if (method === 'POST' && path.endsWith('/absencerequests')) return Response.json({ id: 41, status: 'Submitted' });
   if (method === 'POST' && path.endsWith('/timesheets/approve/simple')) approvedOnce.add('33');

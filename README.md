@@ -188,7 +188,7 @@ A host that has verified a person (signed in, e-mail confirmed) passes `actAs: {
 
 - The person's employee is the one active employee whose work e-mail is `actAs.email`, compared exactly and case-insensitively, after reading every page of `GET /hr/v1.0/employees` with the e-mail as `searchQuery`. No match, several matches or a deactivated one: the result is an error with `actAsRefused: 'no_user'` and a fixed text, and nothing else is sent.
 - A self-service tool without `actAs` is refused with `actAsRefused: 'invalid'`; a malformed `actAs` refuses any call the same way. A self-service tool is never run as anyone else, and its input never names an employee.
-- The shifts and absence requests are asked for the person's employee, and an answer with a row of anyone else is refused whole. `request_my_absence` submits the draft for the person and never approves it.
+- The shifts and absence requests are asked for the person's employee, and an answer with a row of anyone else is refused whole. `request_my_absence` submits the draft for the person and never approves it. The request carries no employee, its accounts do: every account in the draft, and an account given, must be one of the person's own (every page of `GET /absence/v1.0/accounts` for their employee), or nothing is sent.
 - The e-mail is only sent to Planday to find the employee. It is never in the audit (which has the host's `caller`, as a pseudonym), a change's log fields or a text of ours.
 - Company-wide tools ignore `actAs` and run as before with the app's own access.
 

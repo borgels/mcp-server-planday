@@ -17,7 +17,9 @@
   `invalid`. Their input never names an employee, and every row of an answer
   must be the person's own. `request_my_absence` submits Planday's draft for
   the person and never approves it; an account given must be one of the
-  person's own. No new write path: it uses the existing
+  person's own, and so must every account in Planday's draft (read from every page of
+  `GET /absence/v1.0/accounts` for their employee), since the request itself
+  carries no employee; otherwise nothing is sent. No new write path: it uses the existing
   `POST /absence/v1.0/absencerequests`.
 - The catalog marks them with `self: true` (false for every other tool), and
   `request_my_absence` has a change spec (`request`, `absence`; from, to,
